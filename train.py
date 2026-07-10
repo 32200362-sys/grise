@@ -15,7 +15,7 @@ D.I.G 실습 - 빠름/느림 2클래스 분류 모델 학습 스크립트
   1) 먼저 data_collector.py를 실행해 데이터를 수집한다
      (s = 빠름, d = 느림 / 각 클래스 수백 행 이상 권장)
   2) motion_dataset.csv와 이 스크립트를 같은 폴더에 둔다
-  3) python train.py 실행
+  3) python train.py 실행1212
   4) model.pkl 이 생성되면 성공
 """
 
@@ -24,7 +24,7 @@ import sys
 import pickle
 
 import numpy as np
-import pandas as pd
+import pandas as pd # pyright: ignore[reportMissingModuleSource]
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
