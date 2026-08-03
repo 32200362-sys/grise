@@ -198,9 +198,9 @@ def main() -> int:
                               f"pos=({robot.x_cm:.1f},{robot.y_cm:.1f})cm "
                               f"heading={math.degrees(robot.heading_rad):+.0f}deg  {ms:.0f}ms", GREEN))
             else:
-                lines.append((f"ArUco  마커 안보임 (ID {config.ROBOT_MARKER_ID})  {ms:.0f}ms", RED))
+                lines.append((f"ArUco  marker not found (ID {config.ROBOT_MARKER_ID})  {ms:.0f}ms", RED))
         else:
-            lines.append(("ArUco  꺼짐", GRAY))
+            lines.append(("ArUco  off", GRAY))
 
         # Pose/Hand/Gaze는 같은 RGB 프레임을 쓴다. 변환을 한 번만 한다.
         rgb = None
@@ -217,11 +217,11 @@ def main() -> int:
                 n_w = len(human.wrists)
                 for j in human.wrists:
                     cv2.circle(frame, (int(j.px[0]), int(j.px[1])), 12, YELLOW, 2)
-                lines.append((f"Pose   OK   손목 {n_w}개  관절 {len(human.repulsion_points)}개  {ms:.0f}ms", GREEN))
+                lines.append((f"Pose   OK   wrists {n_w}  joints {len(human.repulsion_points)}  {ms:.0f}ms", GREEN))
             else:
-                lines.append((f"Pose   사람 안보임  {ms:.0f}ms", RED))
+                lines.append((f"Pose   no person  {ms:.0f}ms", RED))
         else:
-            lines.append(("Pose   꺼짐", GRAY))
+            lines.append(("Pose   off", GRAY))
 
         # ---- Hand (스켈레톤 + 그립) ----
         if use_hand:
@@ -235,13 +235,13 @@ def main() -> int:
                     if h.valid:
                         parts.append(f"{h.handedness[:1]}(ap{h.aperture:.2f} "
                                      f"op{h.openness:.2f}{' GRASP' if h.grasp_ready else ''})")
-                lines.append((f"Hand   손 {len(hands.hands)}개  "
-                              f"{'  '.join(parts) if parts else '지표없음'}  {ms:.0f}ms",
+                lines.append((f"Hand   hands {len(hands.hands)}  "
+                              f"{'  '.join(parts) if parts else 'no metrics'}  {ms:.0f}ms",
                               (0, 200, 255) if hands.any_grasp_ready else GREEN))
             else:
-                lines.append((f"Hand   손 안보임  {ms:.0f}ms", RED))
+                lines.append((f"Hand   no hand  {ms:.0f}ms", RED))
         else:
-            lines.append(("Hand   꺼짐 (models/hand_landmarker.task 필요)", GRAY))
+            lines.append(("Hand   off (needs models/hand_landmarker.task)", GRAY))
 
         # ---- Gaze (머리 방향) ----
         if use_gaze:
@@ -254,12 +254,12 @@ def main() -> int:
                 gaze_tracker.draw(frame, gaze, world)
                 lines.append((f"Gaze   yaw {gaze.yaw_deg:+.0f}  pitch {gaze.pitch_deg:+.0f}  "
                               f"roll {gaze.roll_deg:+.0f}  {ms:.0f}ms", GREEN))
-                lines.append(("       화살표가 시선과 반대면 설정에서 GAZE_FORWARD_SIGN을 -1로",
+                lines.append(("       if arrow points backwards, set GAZE_FORWARD_SIGN=-1",
                               (150, 150, 150)))
             else:
-                lines.append((f"Gaze   얼굴 안보임  {ms:.0f}ms", RED))
+                lines.append((f"Gaze   no face  {ms:.0f}ms", RED))
         else:
-            lines.append(("Gaze   꺼짐 (models/face_landmarker.task 필요)", GRAY))
+            lines.append(("Gaze   off (needs models/face_landmarker.task)", GRAY))
 
         # ---- 물체 인식 (YOLO 또는 테스트 모드 ArUco) ----
         use_marker_obj = config.TEST_MODE_ARUCO or detector is None
@@ -285,16 +285,16 @@ def main() -> int:
                 marker_detector.draw(frame, world, dets)
 
             col = GREEN if dets else RED
-            lines.append((f"{name} 검출 {len(dets)}개 (cup={'O' if cup else 'X'} "
+            lines.append((f"{name} detections {len(dets)} (cup={'O' if cup else 'X'} "
                           f"obstacle={len(obs)})  {ms:.0f}ms", col))
             if use_marker_obj:
-                lines.append((f"       인식 ID {sorted(config.MARKER_OBJECTS)} / "
-                              f"화면 마커 {scan.ids}", (150, 150, 150)))
+                lines.append((f"       registered IDs {sorted(config.MARKER_OBJECTS)} / "
+                              f"visible markers {scan.ids}", (150, 150, 150)))
             elif dets and cup is None and not obs:
-                lines.append(("       ※ 잡히긴 하는데 cup/obstacle로 분류 안됨 -> "
-                              "config.CLASS_CUP 이름 확인", YELLOW))
+                lines.append(("       detected but not classified as cup/obstacle -> "
+                              "check config.CLASS_CUP name", YELLOW))
         else:
-            lines.append(("YOLO   꺼짐", GRAY))
+            lines.append(("YOLO   off", GRAY))
 
         # ---- HUD ----
         overlay = frame.copy()
@@ -321,10 +321,11 @@ def main() -> int:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1)
 
         # 설정 패널: 바뀐 값 반영 + 현재 상태 전송
+        # 키/값 모두 영문으로. readout 라벨 폰트(Consolas)에는 한글 글리프가 없다.
         panel.pump({
-            "해상도": f"{actual_w}x{actual_h}",
+            "resolution": f"{actual_w}x{actual_h}",
             "FPS": f"{fps:.1f}",
-            "스케일": f"{world.px_per_cm:.2f} px/cm",
+            "scale": f"{world.px_per_cm:.2f} px/cm",
             **{f"L{i + 1}": t for i, (t, _c) in enumerate(lines)},
         })
 

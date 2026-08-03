@@ -223,9 +223,14 @@ class SettingsPanel:
     이 클래스는 tkinter를 import하지 않는다.
 
     영상 루프에서 할 일:
-        panel.pump({"손-컵 거리": "..."})   # 매 프레임 1회
+        panel.pump({"hand-cup": "..."})     # 매 프레임 1회. 키/값은 영문으로.
         panel.toggle()                      # 버튼/키 입력 시
         panel.close()                       # 종료 시
+
+    ★ pump()에 넘기는 dict는 키/값 모두 영문으로 쓸 것 ★
+    readout 라벨이 font=("Consolas", 9)를 쓰는데 Consolas에는 한글 글리프가 없어서
+    한글이 섞이면 깨진 기호로 표시된다. (버튼/탭 라벨은 기본 폰트라 한글이 정상 표시됨 -
+    이 라벨만 예외라 헷갈리기 쉽다)
     """
 
     def __init__(self) -> None:

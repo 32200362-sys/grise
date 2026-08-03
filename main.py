@@ -312,22 +312,27 @@ def main() -> None:
 
             # 설정 패널: 바뀐 값을 config에 반영하고 현재 측정값을 보낸다.
             # 다음 프레임부터 새 값이 그대로 적용된다.
+            #
+            # ★ 키/값 모두 영문으로만 작성할 것 ★
+            # 이 dict는 ui/settings_panel.py의 readout 라벨에 font=("Consolas", 9)로
+            # 그려지는데, Consolas에는 한글 글리프가 없어서 한글이 섞이면 깨진 기호로
+            # 나온다. cv2.putText가 한글을 못 그리는 것과 같은 종류의 문제다.
             panel.pump({
-                "손-컵거리": (f"{risk.distance_cm:.1f} cm"
-                              if risk.distance_cm is not None else "-"),
-                "접근속도": f"{risk.approach_speed_cm_s:+.1f} cm/s",
+                "hand-cup": (f"{risk.distance_cm:.1f} cm"
+                             if risk.distance_cm is not None else "-"),
+                "approach": f"{risk.approach_speed_cm_s:+.1f} cm/s",
                 "TTC": f"{risk.ttc_s:.2f} s" if risk.ttc_s is not None else "-",
-                "위험등급": f"{risk.level}  ({risk.reason})",
-                "의도신호": ("그립 " if risk.intent_grip else "")
-                            + ("시선" if risk.intent_gaze else "")
-                            or "없음",
-                "로봇속도": f"vx {vx_r:+.1f}  vy {vy_r:+.1f} cm/s",
-                "각속도": f"{w_cmd:+.2f} rad/s",
-                "목표거리": (f"{field.goal_distance_cm:.1f} cm"
-                             if field.goal_distance_cm is not None else "-"),
-                "상태": status,
-                "인식": ("ArUco(테스트)" if use_marker else "YOLO")
-                        + f"  컵{'O' if cup else 'X'} 장애물{len(obstacles)}",
+                "risk": f"{risk.level}  ({risk.reason})",
+                "intent": ("grip " if risk.intent_grip else "")
+                          + ("gaze" if risk.intent_gaze else "")
+                          or "none",
+                "robot vel": f"vx {vx_r:+.1f}  vy {vy_r:+.1f} cm/s",
+                "angular": f"{w_cmd:+.2f} rad/s",
+                "goal dist": (f"{field.goal_distance_cm:.1f} cm"
+                              if field.goal_distance_cm is not None else "-"),
+                "status": status,
+                "detector": ("ArUco(test)" if use_marker else "YOLO")
+                            + f"  cup={'O' if cup else 'X'} obstacle={len(obstacles)}",
                 "FPS": f"{fps:.1f}",
             })
 

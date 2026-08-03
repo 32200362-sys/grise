@@ -99,10 +99,13 @@ class RiskEvaluator:
         intent = grip_on or gaze_on
 
         # --- 입력이 없으면 판정 불가. 상태를 리셋하고 SAFE로 둔다. ---
+        # reason은 main.py의 cv2.putText HUD에 그대로 그려진다.
+        # OpenCV Hershey 폰트는 한글 글리프가 없어 한글을 넣으면 화면에서 깨진다.
+        # 그래서 reason은 항상 영문으로만 작성한다 (콘솔 print/설정패널은 별개).
         if cup is None or not human_pose.detected or not human_pose.wrists:
             self.reset()
             s = self._apply_hold(
-                RiskState(level="SAFE", reason="사람 또는 컵 미검출"), now
+                RiskState(level="SAFE", reason="no person or cup"), now
             )
             s.intent, s.intent_grip, s.intent_gaze = intent, grip_on, gaze_on
             return s
@@ -145,32 +148,32 @@ class RiskEvaluator:
         ttc_danger = config.RISK_TTC_DANGER_S * t_boost
         ttc_warn = config.RISK_TTC_WARN_S * t_boost
 
-        # --- 규칙 판정 ---
-        level, reason = "SAFE", "정상"
+        # --- 규칙 판정 (reason은 영문 고정 - 위 주석 참고) ---
+        level, reason = "SAFE", "normal"
 
         if dist < danger_dist:
-            level, reason = "DANGER", f"근접 {dist:.0f}cm"
+            level, reason = "DANGER", f"close {dist:.0f}cm"
         elif (
             speed > config.RISK_APPROACH_SPEED_CM_S
             and ttc is not None
             and ttc < ttc_danger
         ):
-            level, reason = "DANGER", f"급접근 TTC {ttc:.2f}s"
+            level, reason = "DANGER", f"fast approach TTC {ttc:.2f}s"
         elif dist < warn_dist:
-            level, reason = "WARN", f"접근 {dist:.0f}cm"
+            level, reason = "WARN", f"approaching {dist:.0f}cm"
         elif (
             speed > config.RISK_APPROACH_SPEED_CM_S
             and ttc is not None
             and ttc < ttc_warn
         ):
-            level, reason = "WARN", f"접근중 TTC {ttc:.2f}s"
+            level, reason = "WARN", f"approaching TTC {ttc:.2f}s"
 
         if intent and level != "SAFE":
             tags = []
             if grip_on:
-                tags.append("그립")
+                tags.append("grip")
             if gaze_on:
-                tags.append("시선")
+                tags.append("gaze")
             reason += f" +{'/'.join(tags)}"
 
         state = RiskState(
