@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 모델 가중치는 용량이 커서 저장소에 넣지 않는다.
+# Roboflow에서 받거나 tools/download_pose_model.py로 재생성할 수 있다.
+models/*.pt
+models/*.task
+models/*.onnx
+
+# 런타임 산출물
+*.log
+
+# 튜닝 패널이 저장하는 값 (사용자별)
+tuning.json
+
+# 마커 이미지
+aruco_id*.png
+check_*.png

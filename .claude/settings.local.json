@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($base = \"C:\\\\Users\\\\129\\\\Desktop\\\\grise-master\"; New-Item -ItemType Directory -Force -Path \"$base\\\\legacy\" | Out-Null; New-Item -ItemType Directory -Force -Path \"$base\\\\models\" | Out-Null; New-Item -ItemType Directory -Force -Path \"$base\\\\tools\" | Out-Null; foreach \\($f in @\\(\"data_collector.py\",\"train.py\",\"realtime_predict.py\",\"motion_dataset.csv\"\\)\\) { if \\(Test-Path \"$base\\\\$f\"\\) { Move-Item -Path \"$base\\\\$f\" -Destination \"$base\\\\legacy\\\\$f\" -Force } }; Get-ChildItem $base | Select-Object Name, Mode)",
+      "PowerShell(cd C:\\\\Users\\\\129\\\\Desktop\\\\grise-master; foreach \\($m in @\\(\"cv2\",\"numpy\",\"mediapipe\",\"ultralytics\"\\)\\) { $r = python -c \"import $m; print\\('$m', getattr\\($m,'__version__','?'\\)\\)\" 2>$null; if \\($?\\) { echo $r } else { echo \"$m  --- NOT INSTALLED\" } })",
+      "Bash(python3 -c ' *)",
+      "Bash(python -c ' *)",
+      "PowerShell(python -m pip index versions mediapipe 2>&1)",
+      "PowerShell(python -m pip install --dry-run --no-deps mediapipe 2>&1)"
+    ]
+  }
+}

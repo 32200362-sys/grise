@@ -1,0 +1,40 @@
+# D.I.G - PC측 (인식 / 판단 / 경로계산 / 전송 계층)
+#
+# 설치:
+#     python -m venv .venv
+#     .venv\Scripts\activate          (Windows)
+#     pip install -r requirements.txt
+#     python tools/download_pose_model.py
+#
+# 검증된 조합 (Python 3.14.6 / Windows 11):
+#     opencv-python 4.14.0.94 · mediapipe 1.0.0 · numpy 2.5.1
+#     ultralytics 8.4.115 · torch 2.13.0
+
+# --- OpenCV ---
+# contrib가 아니라 일반 opencv-python으로 충분하다.
+# ArUco는 4.7부터 contrib에서 main 저장소(objdetect)로 옮겨져 기본 패키지에 포함된다.
+# (contrib를 따로 깔면 ultralytics가 요구하는 opencv-python과 같은 'cv2'를 두고 충돌한다.
+#  둘 다 설치되면 나중에 깐 쪽이 이겨서 예측 불가능한 상태가 된다)
+# 5.0은 아직 검증 전이라 4.x로 묶어둔다. ultralytics 요구사항(>=4.6.0)과도 호환된다.
+opencv-python>=4.8.0,<5.0.0
+
+# --- MediaPipe ---
+# ★ 0.10.30 이상 필수 ★
+# 이전 버전의 legacy Solutions API(mp.solutions.pose / holistic)는 패키지에서 제거되었고,
+# 이 프로젝트는 새 Tasks API(PoseLandmarker)로 작성되어 있다.
+# 모델 파일(.task)은 별도로 받아야 한다:  python tools/download_pose_model.py
+mediapipe>=0.10.30
+
+# --- numpy ---
+# 버전을 고정하지 않는다. numpy<2.0 은 Python 3.13+ 용 wheel이 없어서
+# 소스 빌드를 시도하다 컴파일러가 없으면 실패한다.
+numpy>=1.24
+
+# --- YOLO backend: config.YOLO_BACKEND 에 맞춰 선택 ---
+# "ultralytics" (권장): 아래 패키지 필요. torch/torchvision(약 2~3GB)을 함께 받는다.
+ultralytics>=8.1.0
+# "roboflow": 아래 주석을 해제하고 ultralytics 줄을 주석 처리
+# inference>=0.9.0
+# "stub": 아무것도 설치할 필요 없음 (물체 검출 비활성화, 배선 테스트용)
+
+# 전송 계층은 표준 라이브러리(socket, json)만 사용한다.
