@@ -30,6 +30,17 @@ DPI = 300  # 인쇄 해상도
 CM_PER_INCH = 2.54
 
 
+def imwrite_unicode(path: Path, img) -> bool:
+    """cv2.imwrite는 Windows에서 사용자명 등에 non-ASCII 문자가 섞인
+    절대경로를 조용히 실패시킨다 (반환값 False, 예외 없음). imencode로
+    메모리에 인코딩한 뒤 파이썬 파일 IO로 쓰면 경로 인코딩과 무관하게 동작한다."""
+    ok, buf = cv2.imencode(path.suffix, img)
+    if not ok:
+        return False
+    path.write_bytes(buf.tobytes())
+    return True
+
+
 def render(aruco_dict, marker_id: int, cm: float, caption: str, note: str):
     """마커 한 장 + 하단 정보/실측 눈금."""
     side_px = int(round(cm / CM_PER_INCH * DPI))
@@ -78,7 +89,7 @@ def make_set(args) -> int:
         img, _ = render(aruco_dict, mid, args.cm,
                         f"ID {mid}  |  {role.upper()}  |  {args.cm:.1f}cm", note)
         p = out_dir / f"marker_{mid:02d}_{role}.png"
-        cv2.imwrite(str(p), img)
+        imwrite_unicode(p, img)
         extra = "" if radius is None else f"  (실제 반경 {radius:.0f}cm)"
         print(f"  ID {mid:>2}  {role:<9} -> {p.name}{extra}")
 
@@ -116,7 +127,7 @@ def main() -> int:
     canvas, side_px = render(aruco_dict, args.id, args.cm, caption, "")
 
     out = Path(__file__).resolve().parent.parent / f"aruco_id{args.id}_{args.cm:.0f}cm.png"
-    cv2.imwrite(str(out), canvas)
+    imwrite_unicode(out, canvas)
 
     print(f"저장 완료: {out}")
     print(f"  사전(dictionary) : {args.dict}")
