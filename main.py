@@ -43,6 +43,7 @@ from perception import (
     RobotTracker,
 )
 from planning import PotentialField, heading_command, world_to_robot
+from safety import IncidentLogger
 from ui import SettingsPanel, load_tuning
 
 # 위험 등급 -> ESP32에 보낼 status
@@ -199,6 +200,7 @@ def main() -> None:
     field_planner = PotentialField()
     sender = UdpSender()
     panel = SettingsPanel()
+    incident_logger = IncidentLogger()
 
     paused = False
     fps = 0.0
@@ -355,6 +357,10 @@ def main() -> None:
                 if paused:
                     cv2.putText(frame, "PAUSED", (config.FRAME_WIDTH // 2 - 90, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+
+                # HUD까지 다 그려진 프레임을 넘긴다 - DANGER 시작 순간만 저장한다.
+                incident_logger.update(frame, risk, now)
+
                 cv2.imshow("D.I.G Pipeline", frame)
 
                 key = cv2.waitKey(1) & 0xFF

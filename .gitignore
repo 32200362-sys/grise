@@ -22,3 +22,6 @@ check_*.png
 
 # 생성된 마커 세트
 markers/
+
+# 위기 상황 스크린샷
+incidents/

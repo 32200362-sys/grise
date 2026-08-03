@@ -72,6 +72,7 @@ PARAM_SPECS: dict[str, list[tuple]] = {
         ("RISK_SPEED_EMA_ALPHA", "속도 스무딩", 0.05, 1.0, 2, "작을수록 부드럽고 느림"),
         ("RISK_DANGER_HOLD_S", "DANGER 유지", 0.0, 3.0, 2, "위험 해제까지 최소 유지 시간"),
         ("RISK_WARN_HOLD_S", "WARN 유지", 0.0, 3.0, 2, "경고 해제까지 최소 유지 시간"),
+        ("INCIDENT_LOG_COOLDOWN_S", "스크린샷 최소간격", 0.5, 30.0, 1, "DANGER 스크린샷 연속 저장 최소 간격(초)"),
     ],
     "경로계산 (potential field)": [
         ("PF_K_ATTRACT", "인력 게인", 0.05, 5.0, 2, "컵으로 끌리는 힘"),
@@ -121,6 +122,8 @@ SPEED_SCALE_KEYS = [
 BOOL_SPECS = [
     ("TEST_MODE_ARUCO", "테스트 모드 (ArUco로 컵/장애물 인식)",
      "YOLO 대신 마커로 인식한다. 모델 없이 전체 파이프라인을 돌려볼 수 있다."),
+    ("INCIDENT_LOG_ENABLED", "위기 상황 스크린샷 저장",
+     "DANGER 시작 순간의 화면을 incidents/ 폴더에 저장한다 (같은 상황 지속 중엔 재저장 안함)."),
     ("INTENT_USE_GRIP", "그립 모양을 의도 신호로 사용",
      "잡을 준비가 된 손 모양이면 거리/TTC 임계를 넓힌다."),
     ("INTENT_USE_GAZE", "시선을 의도 신호로 사용",
