@@ -36,6 +36,8 @@ from perception import (
     Camera,
     GazeTracker,
     HandTracker,
+    MarkerObjectDetector,
+    MarkerScanner,
     ObjectDetector,
     PoseTracker,
     RobotTracker,
@@ -161,9 +163,21 @@ def main() -> None:
     load_tuning()
 
     camera = Camera()
-    detector = ObjectDetector()
     pose_tracker = PoseTracker()
     robot_tracker = RobotTracker()
+
+    # 마커 스캔은 프레임당 한 번만. 로봇 추적과 테스트 모드 물체 검출이 공유한다.
+    scanner = MarkerScanner()
+    marker_detector = MarkerObjectDetector()
+
+    # YOLO는 가중치가 없어도 죽지 않게 한다. 테스트 모드로 계속 쓸 수 있어야 하므로.
+    yolo_detector = None
+    try:
+        yolo_detector = ObjectDetector()
+    except RuntimeError as e:
+        print(f"[YOLO] 비활성화: {str(e).splitlines()[0]}")
+        print("       테스트 모드(ArUco)로 진행합니다. 설정 패널 '모드' 탭에서 전환 가능.")
+        config.TEST_MODE_ARUCO = True
 
     # 의도 신호(그립/시선)는 선택 사항이다. 모델이 없으면 끄고 계속 진행한다.
     # 이 둘은 안전 판정을 직접 내리지 않으므로 없어도 시스템은 정상 동작한다.
@@ -224,8 +238,16 @@ def main() -> None:
             # ---------------- [1] 인식 계층 ----------------
             # ArUco를 먼저 처리해야 px_per_cm 스케일이 갱신되고,
             # 뒤이은 YOLO/Pose의 월드 변환이 올바른 스케일을 쓴다.
-            robot = robot_tracker.process(frame, world)
-            detections = detector.detect(frame, world)
+            # 마커는 한 번만 스캔해서 로봇 추적과 물체 검출이 나눠 쓴다.
+            scan = scanner.scan(frame)
+            robot = robot_tracker.process(frame, world, scan)
+
+            # 테스트 모드면 YOLO 대신 ArUco로 컵/장애물을 인식한다.
+            # 설정 패널에서 실행 중에 전환할 수 있으므로 매 프레임 확인한다.
+            use_marker = config.TEST_MODE_ARUCO or yolo_detector is None
+            det_source = marker_detector if use_marker else yolo_detector
+            detections = det_source.detect(frame, world, scan=scan, now=now)
+
             human = pose_tracker.process(rgb, world, now)
 
             cup = ObjectDetector.pick_cup(detections)
@@ -285,7 +307,7 @@ def main() -> None:
                     f"v=({vx_r:+6.1f},{vy_r:+6.1f})cm/s w={w_cmd:+5.2f} "
                     f"robot={'O' if robot.detected else 'X'} "
                     f"cup={'O' if cup else 'X'} obs={len(obstacles)} "
-                    f"{fps:.1f}fps"
+                    f"[{'ArUco' if use_marker else 'YOLO'}] {fps:.1f}fps"
                 )
 
             # 설정 패널: 바뀐 값을 config에 반영하고 현재 측정값을 보낸다.
@@ -304,6 +326,8 @@ def main() -> None:
                 "목표거리": (f"{field.goal_distance_cm:.1f} cm"
                              if field.goal_distance_cm is not None else "-"),
                 "상태": status,
+                "인식": ("ArUco(테스트)" if use_marker else "YOLO")
+                        + f"  컵{'O' if cup else 'X'} 장애물{len(obstacles)}",
                 "FPS": f"{fps:.1f}",
             })
 
@@ -314,6 +338,11 @@ def main() -> None:
                     hand_tracker.draw(frame, hands)
                 if gaze is not None:
                     gaze_tracker.draw(frame, gaze, world)
+                if use_marker:
+                    # 마커 외곽선 + '실제 회피 반경'을 그린다.
+                    # 마커 크기와 회피 반경은 다르다는 걸 눈으로 확인하기 위함.
+                    scanner.draw(frame, scan)
+                    marker_detector.draw(frame, world, detections)
                 robot_tracker.draw(frame, robot, world)
                 draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
                          vx_r, vy_r, w_cmd, status, fps)

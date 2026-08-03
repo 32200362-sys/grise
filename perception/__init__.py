@@ -3,6 +3,8 @@
 from .camera import Camera, WorldFrame
 from .gaze_tracker import GazeInfo, GazeTracker
 from .hand_tracker import HandInfo, HandsResult, HandTracker
+from .marker_object_detector import MarkerObjectDetector
+from .marker_scanner import MarkerScan, MarkerScanner
 from .object_detector import Detection, ObjectDetector
 from .pose_tracker import HumanPose, PoseTracker
 from .robot_tracker import RobotPose, RobotTracker
@@ -12,6 +14,9 @@ __all__ = [
     "WorldFrame",
     "Detection",
     "ObjectDetector",
+    "MarkerObjectDetector",
+    "MarkerScan",
+    "MarkerScanner",
     "HumanPose",
     "PoseTracker",
     "HandInfo",

@@ -115,6 +115,22 @@ SPEED_SCALE_KEYS = [
     ("WARN", "WARN 속도배율", 0.0, 1.0),
 ]
 
+# 체크박스로 켜고 끄는 항목.
+# 매 프레임 config에서 읽히는 값만 넣을 것. (USE_HAND/USE_GAZE처럼 시작 시점에
+# 트래커를 만들지 말지 결정하는 값은 실행 중에 바꿔도 효과가 없다)
+BOOL_SPECS = [
+    ("TEST_MODE_ARUCO", "테스트 모드 (ArUco로 컵/장애물 인식)",
+     "YOLO 대신 마커로 인식한다. 모델 없이 전체 파이프라인을 돌려볼 수 있다."),
+    ("INTENT_USE_GRIP", "그립 모양을 의도 신호로 사용",
+     "잡을 준비가 된 손 모양이면 거리/TTC 임계를 넓힌다."),
+    ("INTENT_USE_GAZE", "시선을 의도 신호로 사용",
+     "컵을 보고 있으면 거리/TTC 임계를 넓힌다."),
+    ("SHOW_WINDOW", "영상 창 표시", "끄면 화면 없이 헤드리스로 돈다."),
+    ("DRAW_POSE", "사람 관절 그리기", ""),
+    ("DRAW_DETECTIONS", "검출 박스 그리기", ""),
+    ("DRAW_FIELD_VECTOR", "속도 벡터 그리기", ""),
+]
+
 SS_PREFIX = "SPEED_SCALE::"
 
 _DEFAULTS: dict[str, float] = {}
@@ -132,13 +148,16 @@ def _capture_defaults() -> None:
         return
     for attr, *_ in _all_attrs():
         _DEFAULTS[attr] = getattr(config, attr)
+    for attr, *_ in BOOL_SPECS:
+        _DEFAULTS[attr] = getattr(config, attr)
     for key, *_ in SPEED_SCALE_KEYS:
         _DEFAULTS[SS_PREFIX + key] = config.SPEED_SCALE_BY_RISK[key]
 
 
-def current_values() -> dict[str, float]:
+def current_values() -> dict:
     """현재 config에서 튜닝 대상 값만 뽑아온다."""
     d = {attr: getattr(config, attr) for attr, *_ in _all_attrs()}
+    d.update({attr: bool(getattr(config, attr)) for attr, *_ in BOOL_SPECS})
     for key, *_ in SPEED_SCALE_KEYS:
         d[SS_PREFIX + key] = config.SPEED_SCALE_BY_RISK[key]
     return d
@@ -154,8 +173,14 @@ def apply_value(attr: str, value) -> None:
             config.SPEED_SCALE_BY_RISK[key] = float(value)
     elif hasattr(config, attr):
         cur = getattr(config, attr)
-        setattr(config, attr, int(round(float(value)))
-                if isinstance(cur, int) else float(value))
+        # bool은 int의 하위 클래스라 반드시 int보다 먼저 검사해야 한다.
+        # 순서를 바꾸면 True/False가 1/0 정수로 바뀌어버린다.
+        if isinstance(cur, bool):
+            setattr(config, attr, bool(value))
+        elif isinstance(cur, int):
+            setattr(config, attr, int(round(float(value))))
+        else:
+            setattr(config, attr, float(value))
 
 
 def save_tuning(path: Path = TUNING_FILE) -> None:
@@ -386,8 +411,42 @@ def _run_gui(init_values: dict) -> None:
             evar.set(fmt(v, dec))
         syncers.append(sync)
 
+    def add_check(parent, row, attr, label, desc):
+        var = tk.BooleanVar(value=bool(getattr(config, attr)))
+
+        def on_toggle():
+            v = bool(var.get())
+            apply_value(attr, v)
+            emit(attr, v)
+
+        ttk.Checkbutton(parent, text=label, variable=var,
+                        command=on_toggle).grid(row=row * 2, column=0, columnspan=3,
+                                                sticky="w", padx=8, pady=(10, 0))
+        if desc:
+            ttk.Label(parent, text=desc, foreground="#666", font=("", 8)).grid(
+                row=row * 2 + 1, column=0, columnspan=3, sticky="w", padx=(28, 8))
+
+        def sync():
+            var.set(bool(getattr(config, attr)))
+        syncers.append(sync)
+
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+    # --- 모드 탭 (체크박스) ---
+    tab = ttk.Frame(nb)
+    nb.add(tab, text="모드")
+    for row, (attr, label, desc) in enumerate(BOOL_SPECS):
+        add_check(tab, row, attr, label, desc)
+    ttk.Label(
+        tab,
+        text="테스트 모드에서 인식하는 마커 ID는 config.MARKER_OBJECTS에 있습니다.\n"
+             "각 ID의 '실제 반경'은 반드시 물체의 진짜 크기로 적어야 합니다.\n"
+             "마커 크기가 아닙니다 — 작게 적으면 로봇이 물체를 긁고 지나갑니다.",
+        foreground="#a60", justify="left",
+    ).grid(row=len(BOOL_SPECS) * 2, column=0, columnspan=3,
+           sticky="w", padx=8, pady=(18, 4))
+    tab.columnconfigure(1, weight=1)
 
     for group, specs in PARAM_SPECS.items():
         tab = ttk.Frame(nb)

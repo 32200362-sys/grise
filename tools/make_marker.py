@@ -30,38 +30,90 @@ DPI = 300  # 인쇄 해상도
 CM_PER_INCH = 2.54
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--id", type=int, default=config.ROBOT_MARKER_ID)
-    ap.add_argument("--cm", type=float, default=config.MARKER_SIZE_CM)
-    ap.add_argument("--dict", type=str, default=config.ARUCO_DICT_NAME)
-    args = ap.parse_args()
-
-    aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, args.dict))
-
-    # 물리 크기 -> 픽셀
-    side_px = int(round(args.cm / CM_PER_INCH * DPI))
-    marker = cv2.aruco.generateImageMarker(aruco_dict, args.id, side_px)
+def render(aruco_dict, marker_id: int, cm: float, caption: str, note: str):
+    """마커 한 장 + 하단 정보/실측 눈금."""
+    side_px = int(round(cm / CM_PER_INCH * DPI))
+    marker = cv2.aruco.generateImageMarker(aruco_dict, marker_id, side_px)
 
     # 흰 여백(quiet zone)이 있어야 검출이 안정적이다. 한 변의 25%.
     pad = int(side_px * 0.25)
     canvas = np.full((side_px + 2 * pad, side_px + 2 * pad), 255, np.uint8)
     canvas[pad:pad + side_px, pad:pad + side_px] = marker
+    canvas = cv2.copyMakeBorder(canvas, 0, 160, 0, 0, cv2.BORDER_CONSTANT, value=255)
 
-    # 하단에 정보 + 실측용 눈금 표시
-    canvas = cv2.copyMakeBorder(canvas, 0, 140, 0, 0, cv2.BORDER_CONSTANT, value=255)
     base_y = side_px + 2 * pad
-
-    cv2.putText(canvas, f"{args.dict}  ID={args.id}  {args.cm:.1f}cm",
-                (pad, base_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 1.1, 0, 2)
+    cv2.putText(canvas, caption, (pad, base_y + 45),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, 0, 2)
+    if note:
+        cv2.putText(canvas, note, (pad, base_y + 82),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, 0, 1)
     cv2.putText(canvas, "print at 100% (no fit-to-page), then measure the black square",
-                (pad, base_y + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.62, 0, 1)
+                (pad, base_y + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.55, 0, 1)
 
     # 마커 폭과 정확히 같은 길이의 눈금자 -> 인쇄 후 이 선을 재면 검증된다
-    ry = base_y + 118
+    ry = base_y + 138
     cv2.line(canvas, (pad, ry), (pad + side_px, ry), 0, 3)
     for x in (pad, pad + side_px):
         cv2.line(canvas, (x, ry - 12), (x, ry + 12), 0, 3)
+    return canvas, side_px
+
+
+def make_set(args) -> int:
+    """로봇 + config.MARKER_OBJECTS의 마커를 전부 생성한다 (테스트 모드용)."""
+    aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, args.dict))
+    out_dir = Path(__file__).resolve().parent.parent / "markers"
+    out_dir.mkdir(exist_ok=True)
+
+    jobs = [(config.ROBOT_MARKER_ID, "robot", None)]
+    for mid, (role, radius) in sorted(config.MARKER_OBJECTS.items()):
+        jobs.append((mid, role, radius))
+
+    print("=" * 62)
+    print(f"테스트 모드용 마커 세트 생성 -> {out_dir}")
+    print("=" * 62)
+
+    for mid, role, radius in jobs:
+        note = ("robot front = marker top edge (TL->TR)" if role == "robot"
+                else f"object radius in config = {radius:.0f} cm")
+        img, _ = render(aruco_dict, mid, args.cm,
+                        f"ID {mid}  |  {role.upper()}  |  {args.cm:.1f}cm", note)
+        p = out_dir / f"marker_{mid:02d}_{role}.png"
+        cv2.imwrite(str(p), img)
+        extra = "" if radius is None else f"  (실제 반경 {radius:.0f}cm)"
+        print(f"  ID {mid:>2}  {role:<9} -> {p.name}{extra}")
+
+    print()
+    print("주의")
+    print("  * 전부 100% 배율로 인쇄할 것 (fit-to-page 끄기)")
+    print("  * config.MARKER_OBJECTS의 반경은 '물체의 실제 크기'다. 마커 크기가 아니다.")
+    print("    작게 적으면 로봇이 물체를 긁고 지나간다.")
+    print("  * 마커는 작업면과 나란하게 붙일 것 (세로로 세우면 검출 안 됨)")
+    print("  * 컵은 곡면이라 마커가 휜다. 뚜껑 위나 평평한 받침에 붙이는 게 낫다.")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--id", type=int, default=config.ROBOT_MARKER_ID)
+    ap.add_argument("--cm", type=float, default=config.MARKER_SIZE_CM)
+    ap.add_argument("--dict", type=str, default=config.ARUCO_DICT_NAME)
+    ap.add_argument("--set", action="store_true",
+                    help="로봇 + config.MARKER_OBJECTS의 모든 마커를 한꺼번에 생성")
+    args = ap.parse_args()
+
+    if args.set:
+        return make_set(args)
+
+    aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, args.dict))
+
+    role = config.MARKER_OBJECTS.get(args.id, (None, None))[0]
+    if args.id == config.ROBOT_MARKER_ID:
+        role = "robot"
+    caption = f"{args.dict}  ID={args.id}  {args.cm:.1f}cm"
+    if role:
+        caption += f"  ({role})"
+
+    canvas, side_px = render(aruco_dict, args.id, args.cm, caption, "")
 
     out = Path(__file__).resolve().parent.parent / f"aruco_id{args.id}_{args.cm:.0f}cm.png"
     cv2.imwrite(str(out), canvas)

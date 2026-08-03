@@ -130,13 +130,18 @@ def main() -> int:
             print(f"[Gaze] 사용 불가: {str(e).splitlines()[0]}")
             print("       python tools/download_models.py face")
 
+    from perception import MarkerObjectDetector, MarkerScanner
+    scanner = MarkerScanner()
+    marker_detector = MarkerObjectDetector()
+
     detector = None
     try:
         from perception import ObjectDetector
         detector = ObjectDetector()
     except Exception as e:
         print(f"[YOLO] 사용 불가: {str(e).splitlines()[0]}")
-        print("       config.py에서 YOLO_BACKEND = 'stub' 으로 두면 이 계층만 건너뜁니다.")
+        print("       테스트 모드(ArUco)로 물체를 인식합니다. 설정 '모드' 탭에서 전환 가능.")
+        config.TEST_MODE_ARUCO = True
 
     use_aruco = robot_tracker is not None
     use_pose = pose_tracker is not None
@@ -179,10 +184,12 @@ def main() -> int:
 
         lines = []
 
-        # ---- ArUco ----
+        # ---- ArUco (스캔은 한 번, 로봇 추적과 물체 검출이 공유) ----
+        scan = scanner.scan(frame)
+
         if use_aruco:
             t0 = time.time()
-            robot = robot_tracker.process(frame, world)
+            robot = robot_tracker.process(frame, world, scan)
             ms = (time.time() - t0) * 1000
             if robot.detected:
                 robot_tracker.draw(frame, robot, world)
@@ -254,24 +261,36 @@ def main() -> int:
         else:
             lines.append(("Gaze   꺼짐 (models/face_landmarker.task 필요)", GRAY))
 
-        # ---- YOLO ----
-        if use_yolo:
+        # ---- 물체 인식 (YOLO 또는 테스트 모드 ArUco) ----
+        use_marker_obj = config.TEST_MODE_ARUCO or detector is None
+        if use_marker_obj or use_yolo:
+            src = marker_detector if use_marker_obj else detector
+            name = "ArUco " if use_marker_obj else "YOLO  "
             t0 = time.time()
-            dets = detector.detect(frame, world)
+            dets = src.detect(frame, world, scan=scan, now=now)
             ms = (time.time() - t0) * 1000
-            cup = detector.pick_cup(dets)
-            obs = detector.pick_obstacles(dets)
+            cup = src.pick_cup(dets)
+            obs = src.pick_obstacles(dets)
+
             for d in dets:
                 x1 = int(d.cx_px - d.w_px / 2); y1 = int(d.cy_px - d.h_px / 2)
                 x2 = int(d.cx_px + d.w_px / 2); y2 = int(d.cy_px + d.h_px / 2)
                 col = YELLOW if d.role == "cup" else (80, 80, 255) if d.role == "obstacle" else GRAY
                 cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
-                cv2.putText(frame, f"{d.label} {d.confidence:.2f}", (x1, y1 - 6),
+                cv2.putText(frame, f"{d.label} r={d.radius_cm:.0f}cm", (x1, y1 - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+
+            if use_marker_obj:
+                scanner.draw(frame, scan)
+                marker_detector.draw(frame, world, dets)
+
             col = GREEN if dets else RED
-            lines.append((f"YOLO   검출 {len(dets)}개 (cup={'O' if cup else 'X'} "
+            lines.append((f"{name} 검출 {len(dets)}개 (cup={'O' if cup else 'X'} "
                           f"obstacle={len(obs)})  {ms:.0f}ms", col))
-            if dets and cup is None and not obs:
+            if use_marker_obj:
+                lines.append((f"       인식 ID {sorted(config.MARKER_OBJECTS)} / "
+                              f"화면 마커 {scan.ids}", (150, 150, 150)))
+            elif dets and cup is None and not obs:
                 lines.append(("       ※ 잡히긴 하는데 cup/obstacle로 분류 안됨 -> "
                               "config.CLASS_CUP 이름 확인", YELLOW))
         else:

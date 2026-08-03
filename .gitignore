@@ -19,3 +19,6 @@ tuning.json
 # 마커 이미지
 aruco_id*.png
 check_*.png
+
+# 생성된 마커 세트
+markers/

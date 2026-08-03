@@ -109,10 +109,13 @@ class ObjectDetector:
         print(f"[YOLO] roboflow 모델 로드 완료: {config.ROBOFLOW_MODEL_ID}")
 
     # ---------- 추론 ----------
-    def detect(self, frame, world) -> list[Detection]:
+    def detect(self, frame, world, scan=None, now=None) -> list[Detection]:
         """
         frame(BGR)에서 물체를 검출하고 월드 좌표까지 채워서 반환한다.
         config.YOLO_EVERY_N_FRAMES 마다 한 번만 실제 추론하고, 사이 프레임은 캐시를 쓴다.
+
+        scan/now는 MarkerObjectDetector와 시그니처를 맞추기 위한 것으로 여기선 쓰지 않는다.
+        (호출부가 두 검출기를 구분 없이 쓸 수 있게 하려는 목적)
         """
         self._frame_counter += 1
         should_infer = (self._frame_counter % config.YOLO_EVERY_N_FRAMES) == 0
