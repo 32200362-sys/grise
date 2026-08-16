@@ -24,8 +24,15 @@ D.I.G - PC측 메인 파이프라인 (인식 -> 판단 -> 경로계산 -> 전송
 from __future__ import annotations
 
 import math
+import sys
 import time
 import traceback
+
+if sys.platform == "win32":
+    # Windows 콘솔 기본 코드페이지(cp949)는 이모지/em-dash 등 일부 유니코드 문자를
+    # 인코딩하지 못해 print()에서 UnicodeEncodeError로 죽는다. UTF-8로 강제한다.
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
 
 import cv2
 
