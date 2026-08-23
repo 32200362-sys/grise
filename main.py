@@ -82,7 +82,7 @@ def draw_settings_button(frame, hovered: bool) -> None:
 
 
 def draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
-             vx_r, vy_r, w, status, fps):
+             vx_r, vy_r, w, status, fps, cup_on_robot=False):
     """디버그 오버레이."""
     h, wpx = frame.shape[:2]
 
@@ -113,6 +113,10 @@ def draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
                  (int(nearest.px[0]), int(nearest.px[1])),
                  (int(cup.cx_px), int(cup.cy_px)),
                  RISK_COLOR[risk.level], 2)
+
+    # --- 컵 적재 표시 (로봇 위치에 링) ---
+    if cup_on_robot and robot.detected:
+        cv2.circle(frame, (int(robot.px[0]), int(robot.px[1])), 26, (0, 255, 0), 3)
 
     # --- 속도 벡터 (월드 -> 픽셀) ---
     if config.DRAW_FIELD_VECTOR and robot.detected and field.speed > 0.5:
@@ -151,6 +155,8 @@ def draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
         panel.append(("NO CUP DETECTED", (0, 165, 255), 0.5))
     elif field.goal_reached:
         panel.append(("GOAL REACHED", (0, 255, 0), 0.6))
+    if cup_on_robot:
+        panel.append(("CUP ON ROBOT", (0, 255, 0), 0.6))
 
     y = 30
     for text, color, size in panel:
@@ -217,6 +223,9 @@ def main() -> None:
     # 마우스로 SETTINGS 버튼을 누를 수 있게 한다.
     mouse_state = {"hover": False}
 
+    # 로봇 위 컵 적재 판정: 경계값 근처에서 깜빡이지 않도록 hold를 둔다.
+    cup_on_robot_state = {"last_true_t": -1e9}
+
     def on_mouse(event, x, y, flags, _param):
         mouse_state["hover"] = _in_rect(x, y, BTN_RECT)
         if event == cv2.EVENT_LBUTTONDOWN and mouse_state["hover"]:
@@ -261,6 +270,17 @@ def main() -> None:
 
             cup = ObjectDetector.pick_cup(detections)
             obstacles = ObjectDetector.pick_obstacles(detections)
+
+            # 로봇 마커 <-> 컵 거리가 가까우면 "컵이 로봇 위에 올라갔다"로 본다.
+            if robot.detected and cup:
+                dist_robot_cup = math.hypot(
+                    robot.x_cm - cup.x_cm, robot.y_cm - cup.y_cm
+                )
+                if dist_robot_cup < config.CUP_ON_ROBOT_DIST_CM:
+                    cup_on_robot_state["last_true_t"] = now
+            cup_on_robot = (
+                now - cup_on_robot_state["last_true_t"] < config.CUP_ON_ROBOT_HOLD_S
+            )
 
             # 의도 신호 (그립 모양 / 시선). 없으면 None -> 판정에 영향 없음.
             hands = hand_tracker.process(rgb, world, now) if hand_tracker else None
@@ -342,6 +362,7 @@ def main() -> None:
                 "status": status,
                 "detector": ("ArUco(test)" if use_marker else "YOLO")
                             + f"  cup={'O' if cup else 'X'} obstacle={len(obstacles)}",
+                "cup on robot": "YES" if cup_on_robot else "no",
                 "FPS": f"{fps:.1f}",
             })
 
@@ -359,7 +380,7 @@ def main() -> None:
                     marker_detector.draw(frame, world, detections)
                 robot_tracker.draw(frame, robot, world)
                 draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
-                         vx_r, vy_r, w_cmd, status, fps)
+                         vx_r, vy_r, w_cmd, status, fps, cup_on_robot=cup_on_robot)
                 draw_settings_button(frame, mouse_state["hover"])
                 if paused:
                     cv2.putText(frame, "PAUSED", (config.FRAME_WIDTH // 2 - 90, 60),
