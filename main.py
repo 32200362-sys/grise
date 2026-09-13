@@ -54,7 +54,16 @@ from safety import IncidentLogger
 from ui import SettingsPanel, load_tuning
 
 # 위험 등급 -> ESP32에 보낼 status
-STATUS_BY_RISK = {"SAFE": "RUN", "WARN": "SLOW", "DANGER": "STOP"}
+# ★ ESP32 펌웨어(esp32_omni_controller.ino)는 status를 "RUN"|"SLOW"|"STOP" 셋만
+#   화이트리스트로 받아들인다(isValidStatus). 그 외 문자열은 invalid로 보고
+#   failClosedStop()이 호출되어 강제 정지+STOP으로 덮어써진다. 그리고 "STOP"은
+#   그 자체로 vx/vy/w를 0으로 만든다.
+#   IDLE_UNTIL_THREAT 모드에서는 DANGER가 "정지"가 아니라 "회피(물러남)"를 뜻하므로,
+#   "STOP"이나 화이트리스트에 없는 값을 보내면 회피 동작 자체가 안 나온다.
+if config.IDLE_UNTIL_THREAT:
+    STATUS_BY_RISK = {"SAFE": "RUN", "WARN": "SLOW", "DANGER": "RUN"}
+else:
+    STATUS_BY_RISK = {"SAFE": "RUN", "WARN": "SLOW", "DANGER": "STOP"}
 
 RISK_COLOR = {
     "SAFE": (0, 220, 0),
@@ -324,7 +333,9 @@ def main() -> None:
 
             # ---------------- [4] 전송 계층 ----------------
             # DANGER/정지 상황은 주기를 기다리지 않고 즉시 보낸다.
-            urgent = status == "STOP"
+            # IDLE_UNTIL_THREAT 모드에서는 DANGER의 status 문자열이 "STOP"이 아니라
+            # "RUN"(회피 물러남)이므로, status만으로는 긴급도를 못 가려낸다 - risk.level도 같이 본다.
+            urgent = status == "STOP" or risk.level == "DANGER"
             sender.send(vx_r, vy_r, w_cmd, status, force=urgent)
 
             # ---------------- 디버그 ----------------

@@ -1,401 +1,870 @@
-/*
- * D.I.G - [5] 제어 계층 (ESP32, C++)
- * ============================================================
- *  PC(main.py)가 UDP로 보내는 {vx, vy, w, status} JSON을 받아
- *  3륜 옴니휠 역기구학 -> 바퀴별 목표속도 -> 엔코더 PID -> PWM 출력.
- *
- *  수신 패킷:
- *    {"seq":1234,"t":1699.5,"vx":12.3,"vy":-4.5,"w":0.35,"status":"RUN"}
- *      vx : 로봇 정면(+X_robot) 방향 속도 [cm/s]
- *      vy : 로봇 좌측(+Y_robot) 방향 속도 [cm/s]
- *      w  : 각속도 [rad/s], 반시계(CCW) 양수
- *      status : "RUN" | "SLOW" | "STOP"
- *
- *  ★ 필수 안전장치 ★
- *    CMD_TIMEOUT_MS 동안 유효한 패킷이 없으면 즉시 정지한다.
- *    PC가 죽든, WiFi가 끊기든, 케이블이 빠지든 로봇은 반드시 선다.
- *    이 타임아웃은 어떤 상황에서도 우회되면 안 된다.
- *
- *  필요 라이브러리:
- *    - ArduinoJson (v7 이상)     : 라이브러리 매니저에서 설치
- *    - ESP32 Arduino Core        : v2.x / v3.x 모두 지원 (아래 LEDC 호환 처리)
- * ============================================================
- */
-
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
 #include <math.h>
 
-// ============================================================
-// 1. 사용자 설정
-// ============================================================
-static const char* WIFI_SSID = "YOUR_WIFI_SSID";
-static const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+// =====================================================
+// D.I.G / GRISE Wi-Fi Omni Controller
+//
+// Base hardware mapping: test2.ino
+// Added:
+//   - Wi-Fi + UDP JSON command receive
+//   - {vx, vy, w, status} body velocity commands
+//   - 3-wheel omni inverse kinematics
+//   - Encoder wheel-speed PID
+//   - 300 ms command watchdog
+//   - Wi-Fi-loss / invalid-status fail-safe STOP
+//   - Existing serial motor-test commands retained
+//
+// Arduino-ESP32 Core 3.x
+// Required library: ArduinoJson v7
+//
+// ★ status는 "RUN" | "SLOW" | "STOP" 셋만 유효하다 (isValidStatus).
+//   그 외 문자열은 invalid로 보고 failClosedStop()이 호출되어
+//   강제 정지 + status가 "STOP"으로 덮어써진다.
+//   main.py 쪽에서 이 셋 이외의 값을 보내면 안 된다.
+// =====================================================
 
-static const uint16_t UDP_PORT = 8888;
+// =====================================================
+// 1) USER SETTINGS
+// =====================================================
 
-// 고정 IP - PC의 config.ESP32_IP와 반드시 일치시킬 것.
-// DHCP를 쓰면 IP가 바뀌어 PC가 엉뚱한 곳으로 전송하게 된다.
-static IPAddress LOCAL_IP(192, 168, 0, 50);
-static IPAddress GATEWAY (192, 168, 0, 1);
-static IPAddress SUBNET  (255, 255, 255, 0);
+constexpr uint32_t SERIAL_BAUD = 115200;
 
-// --- 안전 타임아웃 (필수) ---
-static const uint32_t CMD_TIMEOUT_MS = 300;   // PC는 30Hz(33ms)로 보낸다. 9패킷 유실 = 정지.
+// ---- Wi-Fi ----
+// 반드시 실제 공유기 정보로 바꿔주세요.
+const char *WIFI_SSID = "jg";
+const char *WIFI_PASS = "jugon0607!";
 
-// --- 로봇 기구 제원 (실측해서 반드시 수정할 것) ---
-static const float WHEEL_RADIUS_CM   = 2.9f;   // 옴니휠 반지름
-static const float ROBOT_RADIUS_CM   = 9.0f;   // 로봇 중심 ~ 바퀴 접지점 거리 (L)
-static const float ENCODER_CPR       = 11.0f;  // 엔코더 1회전 펄스 (모터축 기준)
-static const float GEAR_RATIO        = 30.0f;  // 감속비
-// 출력축 1회전당 엔코더 tick 수 (A상 하강/상승 모두 세면 x2, 여기선 상승만 세므로 x1)
-static const float TICKS_PER_REV     = ENCODER_CPR * GEAR_RATIO;
+// grise/config.py 기본값(192.168.0.50)과 맞춘 고정 IP.
+// 공유기 대역이 다르면 반드시 수정하세요.
+constexpr bool USE_STATIC_IP = true;
+IPAddress LOCAL_IP(10, 182, 7, 50);
+IPAddress GATEWAY (10, 182, 7, 110);
+IPAddress SUBNET(255, 255, 255, 0);
+IPAddress DNS1(8, 8, 8, 8);
 
-// 모터가 낼 수 있는 최대 바퀴 선속도 [cm/s]. PWM 정규화 및 포화 판단에 쓴다.
-static const float MAX_WHEEL_SPEED_CM_S = 60.0f;
+constexpr uint16_t UDP_PORT = 8888;
+constexpr uint32_t CMD_TIMEOUT_MS = 300;
+constexpr uint32_t WIFI_RETRY_MS = 3000;
 
-/*
- * --- 3륜 옴니 배치 ---
- * 각 바퀴의 장착각 α_i : 로봇 +X축(정면)에서 반시계로 잰 각도.
- * 바퀴는 자기 위치의 접선 방향으로 구동력을 낸다. 따라서
- *
- *     v_i = -sin(α_i)*vx + cos(α_i)*vy + L*w
- *
- * 기본값 0/120/240도 배치에서 검증:
- *   순수 전진(vx>0) -> v0 = 0, v1 = -0.866vx, v2 = +0.866vx  (0도 바퀴는 정지) OK
- *   순수 회전(w>0)  -> 세 바퀴 모두 +L*w (같은 방향)              OK
- *
- * 실제 로봇 배치가 다르면 이 각도만 바꾸면 된다.
- */
-static const float WHEEL_ANGLE_DEG[3] = { 0.0f, 120.0f, 240.0f };
+// ---- PWM ----
+constexpr uint32_t PWM_FREQUENCY = 20000;
+constexpr uint8_t PWM_RESOLUTION = 8;
+constexpr int PWM_MAX = 255;
+constexpr int PWM_MIN_MOVE = 45;  // 실제 모터 데드존에 맞춰 튜닝
 
-// --- 핀 배치 (TB6612FNG / DRV8833 계열: PWM + IN1 + IN2) ---
-static const int PIN_PWM[3] = { 25, 26, 27 };
-static const int PIN_IN1[3] = { 14, 12, 13 };
-static const int PIN_IN2[3] = { 32, 33, 15 };
+constexpr uint8_t MOTOR_COUNT = 3;
 
-// --- 엔코더 핀 (A상은 인터럽트 가능 핀이어야 한다) ---
-static const int PIN_ENC_A[3] = { 34, 35, 36 };
-static const int PIN_ENC_B[3] = { 39, 16, 17 };
+// ---- Encoder ----
+// GA25-370: motor shaft 11 PPR × reduction ratio 74.83
+// A phase rising only.
+constexpr float COUNTS_PER_OUTPUT_REV = 11.0f * 74.83f;
+constexpr uint32_t ENCODER_TELEMETRY_MS = 200;
 
-// 바퀴 회전 방향이 반대로 달렸으면 -1로 뒤집는다.
-static const int WHEEL_DIR_SIGN[3] = { 1, 1, 1 };
+// ---- Robot geometry ----
+// 아래 2개 값은 실제 로봇을 자로 재서 최종 보정하세요.
+constexpr float WHEEL_RADIUS_CM = 2.9f;
+constexpr float ROBOT_RADIUS_CM = 9.0f;
 
-// --- PWM 설정 ---
-static const int PWM_FREQ_HZ  = 20000;   // 20kHz - 가청 대역 밖
-static const int PWM_RES_BITS = 10;      // 0 ~ 1023
-static const int PWM_MAX      = (1 << PWM_RES_BITS) - 1;
-static const int PWM_MIN_MOVE = 90;      // 이 이하는 모터가 안 도는 데드존
+// 휠 장착각: robot +X(front) 기준 CCW.
+constexpr float WHEEL_ANGLE_DEG[MOTOR_COUNT] = {0.0f, 120.0f, 240.0f};
 
-// --- PID 게인 (바퀴 속도 제어, 단위: cm/s -> PWM) ---
-static float KP = 12.0f;
-static float KI = 45.0f;
-static float KD = 0.35f;
+// 한 바퀴라도 이 속도를 넘으면 세 바퀴를 같은 비율로 축소.
+constexpr float MAX_WHEEL_SPEED_CM_S = 60.0f;
 
-static const uint32_t CONTROL_PERIOD_MS = 10;   // 100Hz 제어 주기
+// PC에서 오는 body command의 비정상 값 방어용 상한.
+constexpr float MAX_CMD_LINEAR_CM_S = 50.0f;
+constexpr float MAX_CMD_ANGULAR_RAD_S = 3.0f;
 
-// ============================================================
-// 2. 전역 상태
-// ============================================================
+// status=SLOW일 때 ESP32에서도 한 번 더 상한을 건다.
+// PC가 이미 0.4배 감속하므로 여기서는 '배율'이 아니라 최대치만 제한한다.
+constexpr float SLOW_MAX_LINEAR_CM_S = 15.0f;
+constexpr float SLOW_MAX_ANGULAR_RAD_S = 1.0f;
+
+// ---- Control loop ----
+constexpr uint32_t CONTROL_PERIOD_MS = 10; // 100 Hz
+
+// 8-bit PWM용 보수적 초기값. 실제 로봇에서 반드시 튜닝할 것.
+float PID_KP = 3.0f;
+float PID_KI = 8.0f;
+float PID_KD = 0.05f;
+
+// 엔코더 순간 속도 LPF: new = old*(1-a) + raw*a
+constexpr float SPEED_FILTER_ALPHA = 0.30f;
+
+// =====================================================
+// 2) HARDWARE PIN MAP - test2.ino 그대로 유지
+// =====================================================
+
+constexpr uint8_t PIN_STBY = 27;
+
+constexpr uint8_t M1_IN1 = 19;
+constexpr uint8_t M1_IN2 = 18;
+constexpr uint8_t M1_PWM = 25;
+constexpr uint8_t M1_ENC_A = 34;
+constexpr uint8_t M1_ENC_B = 35;
+
+constexpr uint8_t M2_IN1 = 21;
+constexpr uint8_t M2_IN2 = 22;
+constexpr uint8_t M2_PWM = 26;
+constexpr uint8_t M2_ENC_A = 16;
+constexpr uint8_t M2_ENC_B = 17;
+
+constexpr uint8_t M3_IN1 = 23;
+constexpr uint8_t M3_IN2 = 13;
+constexpr uint8_t M3_PWM = 14;
+constexpr uint8_t M3_ENC_A = 32;
+constexpr uint8_t M3_ENC_B = 33;
+
+// =====================================================
+// 3) TYPES / GLOBAL STATE
+// =====================================================
+
+struct Motor {
+    uint8_t in1;
+    uint8_t in2;
+    uint8_t pwmPin;
+    uint8_t encoderA;
+    uint8_t encoderB;
+    bool motorReversed;
+    bool encoderReversed;
+    int currentPwm;
+};
+
+Motor motors[MOTOR_COUNT] = {
+    {M1_IN1, M1_IN2, M1_PWM, M1_ENC_A, M1_ENC_B, false, false, 0},
+    {M2_IN1, M2_IN2, M2_PWM, M2_ENC_A, M2_ENC_B, false, false, 0},
+    {M3_IN1, M3_IN2, M3_PWM, M3_ENC_A, M3_ENC_B, false, false, 0},
+};
+
+enum ControlMode {
+    MODE_NETWORK,
+    MODE_MANUAL_PWM,
+};
+
+ControlMode controlMode = MODE_NETWORK;
+
 WiFiUDP udp;
-char packetBuf[512];
+bool udpStarted = false;
+uint32_t lastWifiRetryMs = 0;
+char packetBuffer[512];
 
-// PC로부터 받은 최신 명령
-volatile float cmd_vx = 0.0f;     // cm/s
-volatile float cmd_vy = 0.0f;     // cm/s
-volatile float cmd_w  = 0.0f;     // rad/s
-String  cmd_status    = "STOP";
-uint32_t last_cmd_ms  = 0;
-int32_t  last_seq     = -1;
+volatile int32_t encoderCounts[MOTOR_COUNT] = {0, 0, 0};
 
-bool     estopped     = true;     // 부팅 직후는 정지 상태에서 시작
+// 200ms telemetry용
+int32_t previousTelemetryCounts[MOTOR_COUNT] = {0, 0, 0};
+float encoderRpm[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f};
+uint32_t lastTelemetryMs = 0;
+bool streamEnabled = false;
 
-// 엔코더 카운터 (ISR에서 갱신)
-volatile int32_t encTicks[3] = { 0, 0, 0 };
-int32_t prevTicks[3] = { 0, 0, 0 };
-
-// PID 상태
-float targetSpeed[3]  = { 0, 0, 0 };   // cm/s
-float measSpeed[3]    = { 0, 0, 0 };   // cm/s
-float integral[3]     = { 0, 0, 0 };
-float prevError[3]    = { 0, 0, 0 };
-
+// 100Hz wheel control용
+int32_t previousControlCounts[MOTOR_COUNT] = {0, 0, 0};
+float targetWheelSpeed[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f}; // cm/s
+float measuredWheelSpeed[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f}; // cm/s
+float pidIntegral[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f};
+float pidPreviousError[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f};
 uint32_t lastControlMs = 0;
-uint32_t lastStatusMs  = 0;
 
-// ============================================================
-// 3. LEDC 호환 래퍼 (ESP32 Core 2.x / 3.x)
-// ============================================================
-static void pwmSetup(int idx, int pin) {
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcAttach(pin, PWM_FREQ_HZ, PWM_RES_BITS);
-#else
-  ledcSetup(idx, PWM_FREQ_HZ, PWM_RES_BITS);
-  ledcAttachPin(pin, idx);
-#endif
+// 최신 네트워크 명령
+float cmdVx = 0.0f;  // cm/s, robot forward +
+float cmdVy = 0.0f;  // cm/s, robot left +
+float cmdW = 0.0f;   // rad/s, CCW +
+String cmdStatus = "STOP";
+int32_t lastSeq = -1;
+uint32_t lastCommandMs = 0;
+
+bool networkStopped = true;
+uint32_t lastStatusPrintMs = 0;
+
+// =====================================================
+// 4) ENCODER ISR
+// =====================================================
+
+void IRAM_ATTR encoder1ISR() {
+    int direction = digitalRead(M1_ENC_B) ? -1 : 1;
+    if (motors[0].encoderReversed) direction = -direction;
+    encoderCounts[0] += direction;
 }
 
-static void pwmWrite(int idx, int pin, int duty) {
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcWrite(pin, duty);
-#else
-  (void)pin;
-  ledcWrite(idx, duty);
-#endif
+void IRAM_ATTR encoder2ISR() {
+    int direction = digitalRead(M2_ENC_B) ? -1 : 1;
+    if (motors[1].encoderReversed) direction = -direction;
+    encoderCounts[1] += direction;
 }
 
-// ============================================================
-// 4. 엔코더 ISR
-// ============================================================
-// A상 상승엣지에서 B상을 읽어 회전 방향을 판별하는 표준 방식.
-void IRAM_ATTR encISR0() { encTicks[0] += digitalRead(PIN_ENC_B[0]) ? 1 : -1; }
-void IRAM_ATTR encISR1() { encTicks[1] += digitalRead(PIN_ENC_B[1]) ? 1 : -1; }
-void IRAM_ATTR encISR2() { encTicks[2] += digitalRead(PIN_ENC_B[2]) ? 1 : -1; }
-
-// ============================================================
-// 5. 모터 구동
-// ============================================================
-static void motorWrite(int i, float pwmSigned) {
-  int duty = (int)fabsf(pwmSigned);
-  if (duty > PWM_MAX) duty = PWM_MAX;
-
-  // 데드존 보정: 작지만 0이 아닌 명령은 최소 구동 PWM까지 끌어올린다.
-  if (duty > 0 && duty < PWM_MIN_MOVE) duty = PWM_MIN_MOVE;
-
-  bool forward = (pwmSigned >= 0);
-  if (WHEEL_DIR_SIGN[i] < 0) forward = !forward;
-
-  if (duty == 0) {
-    // 브레이크 (양쪽 HIGH) - 관성 주행보다 정지가 빠르다
-    digitalWrite(PIN_IN1[i], HIGH);
-    digitalWrite(PIN_IN2[i], HIGH);
-  } else if (forward) {
-    digitalWrite(PIN_IN1[i], HIGH);
-    digitalWrite(PIN_IN2[i], LOW);
-  } else {
-    digitalWrite(PIN_IN1[i], LOW);
-    digitalWrite(PIN_IN2[i], HIGH);
-  }
-  pwmWrite(i, PIN_PWM[i], duty);
+void IRAM_ATTR encoder3ISR() {
+    int direction = digitalRead(M3_ENC_B) ? -1 : 1;
+    if (motors[2].encoderReversed) direction = -direction;
+    encoderCounts[2] += direction;
 }
 
-static void stopAllMotors() {
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(PIN_IN1[i], HIGH);
-    digitalWrite(PIN_IN2[i], HIGH);   // 브레이크
-    pwmWrite(i, PIN_PWM[i], 0);
-    targetSpeed[i] = 0.0f;
-    integral[i]    = 0.0f;            // 적분 와인드업 제거
-    prevError[i]   = 0.0f;
-  }
-}
-
-// ============================================================
-// 6. 역기구학 - 몸체 속도 (vx, vy, w) -> 바퀴 선속도 3개
-// ============================================================
-static void inverseKinematics(float vx, float vy, float w, float out[3]) {
-  for (int i = 0; i < 3; i++) {
-    float a = WHEEL_ANGLE_DEG[i] * (float)M_PI / 180.0f;
-    out[i] = -sinf(a) * vx + cosf(a) * vy + ROBOT_RADIUS_CM * w;
-  }
-
-  // 포화 처리: 한 바퀴라도 최대치를 넘으면 세 바퀴를 같은 비율로 줄인다.
-  // 개별로 자르면 합성 속도의 '방향'이 틀어져 로봇이 엉뚱하게 간다.
-  float maxAbs = 0.0f;
-  for (int i = 0; i < 3; i++) maxAbs = fmaxf(maxAbs, fabsf(out[i]));
-  if (maxAbs > MAX_WHEEL_SPEED_CM_S) {
-    float k = MAX_WHEEL_SPEED_CM_S / maxAbs;
-    for (int i = 0; i < 3; i++) out[i] *= k;
-  }
-}
-
-// ============================================================
-// 7. UDP 수신 + JSON 파싱
-// ============================================================
-static void receiveCommand() {
-  int packetSize = udp.parsePacket();
-  while (packetSize > 0) {
-    int len = udp.read(packetBuf, sizeof(packetBuf) - 1);
-    if (len > 0) {
-      packetBuf[len] = '\0';
-
-      JsonDocument doc;
-      DeserializationError err = deserializeJson(doc, packetBuf);
-
-      if (err) {
-        Serial.printf("[JSON] 파싱 실패: %s\n", err.c_str());
-      } else {
-        int32_t seq = doc["seq"] | -1;
-
-        // 순서가 뒤바뀐(오래된) 패킷은 버린다. UDP는 순서를 보장하지 않는다.
-        // seq가 줄어들었는데 차이가 크면 PC가 재시작한 것으로 보고 받아들인다.
-        bool stale = (seq >= 0 && last_seq >= 0 && seq <= last_seq && (last_seq - seq) < 1000);
-        if (!stale) {
-          last_seq = seq;
-          cmd_vx = doc["vx"] | 0.0f;
-          cmd_vy = doc["vy"] | 0.0f;
-          cmd_w  = doc["w"]  | 0.0f;
-          cmd_status = String((const char*)(doc["status"] | "STOP"));
-          last_cmd_ms = millis();
-        }
-      }
-    }
-    packetSize = udp.parsePacket();   // 밀린 패킷이 있으면 최신 것까지 소비
-  }
-}
-
-// ============================================================
-// 8. 속도 측정 + PID
-// ============================================================
-static void updateSpeeds(float dt) {
-  for (int i = 0; i < 3; i++) {
+void snapshotEncoderCounts(int32_t snapshot[MOTOR_COUNT]) {
     noInterrupts();
-    int32_t ticks = encTicks[i];
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) snapshot[i] = encoderCounts[i];
+    interrupts();
+}
+
+// =====================================================
+// 5) MOTOR OUTPUT
+// =====================================================
+
+void printMotorName(uint8_t motorIndex) {
+    Serial.print("M");
+    Serial.print(motorIndex + 1);
+}
+
+void writeMotorPwm(uint8_t motorIndex, int pwm, bool verbose = false) {
+    if (motorIndex >= MOTOR_COUNT) return;
+
+    Motor &motor = motors[motorIndex];
+    pwm = constrain(pwm, -PWM_MAX, PWM_MAX);
+
+    // 방향 전환 전 PWM 제거
+    ledcWrite(motor.pwmPin, 0);
+
+    if (pwm == 0) {
+        // test2.ino와 같은 Coast 정지
+        digitalWrite(motor.in1, LOW);
+        digitalWrite(motor.in2, LOW);
+        motor.currentPwm = 0;
+        if (verbose) {
+            printMotorName(motorIndex);
+            Serial.println(" stopped.");
+        }
+        return;
+    }
+
+    bool forward = pwm > 0;
+    if (motor.motorReversed) forward = !forward;
+
+    if (forward) {
+        digitalWrite(motor.in1, HIGH);
+        digitalWrite(motor.in2, LOW);
+    } else {
+        digitalWrite(motor.in1, LOW);
+        digitalWrite(motor.in2, HIGH);
+    }
+
+    delayMicroseconds(50);
+
+    const int duty = abs(pwm);
+    ledcWrite(motor.pwmPin, duty);
+    motor.currentPwm = pwm;
+
+    if (verbose) {
+        printMotorName(motorIndex);
+        Serial.print(" PWM = ");
+        Serial.println(pwm);
+    }
+}
+
+void setAllMotorsManual(int m1, int m2, int m3) {
+    controlMode = MODE_MANUAL_PWM;
+    writeMotorPwm(0, m1, true);
+    writeMotorPwm(1, m2, true);
+    writeMotorPwm(2, m3, true);
+}
+
+void resetPidState() {
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        targetWheelSpeed[i] = 0.0f;
+        pidIntegral[i] = 0.0f;
+        pidPreviousError[i] = 0.0f;
+    }
+}
+
+void stopAllMotors(bool verbose = false) {
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        writeMotorPwm(i, 0, false);
+    }
+    resetPidState();
+    if (verbose) Serial.println("All motors stopped.");
+}
+
+// =====================================================
+// 6) ENCODER SPEED
+// =====================================================
+
+void zeroEncoders() {
+    noInterrupts();
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) encoderCounts[i] = 0;
     interrupts();
 
-    int32_t delta = ticks - prevTicks[i];
-    prevTicks[i] = ticks;
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        previousTelemetryCounts[i] = 0;
+        previousControlCounts[i] = 0;
+        encoderRpm[i] = 0.0f;
+        measuredWheelSpeed[i] = 0.0f;
+    }
 
-    // tick -> 회전수 -> 바퀴 원주 -> cm/s
-    float revs = (float)delta / TICKS_PER_REV;
-    float cm   = revs * 2.0f * (float)M_PI * WHEEL_RADIUS_CM;
-    float raw  = cm / dt;
-
-    // 1차 저역통과 - 엔코더 양자화 노이즈 제거
-    measSpeed[i] = 0.7f * measSpeed[i] + 0.3f * raw * WHEEL_DIR_SIGN[i];
-  }
+    lastTelemetryMs = millis();
+    lastControlMs = millis();
+    Serial.println("Encoder counts reset.");
 }
 
-static void runPID(float dt) {
-  for (int i = 0; i < 3; i++) {
-    float error = targetSpeed[i] - measSpeed[i];
+void updateWheelSpeedForControl(float dt) {
+    int32_t current[MOTOR_COUNT];
+    snapshotEncoderCounts(current);
 
-    float p = KP * error;
-    float d = KD * (error - prevError[i]) / dt;
-    prevError[i] = error;
+    const float wheelCircumference = 2.0f * (float)M_PI * WHEEL_RADIUS_CM;
 
-    // 적분: 출력이 포화됐을 땐 적분을 멈춘다 (anti-windup)
-    float candidate = integral[i] + error * dt;
-    float iTerm = KI * candidate;
-    float total = p + iTerm + d;
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        const int32_t delta = current[i] - previousControlCounts[i];
+        previousControlCounts[i] = current[i];
 
-    if (total > -PWM_MAX && total < PWM_MAX) {
-      integral[i] = candidate;   // 포화 아님 -> 적분 반영
+        const float rev = (float)delta / COUNTS_PER_OUTPUT_REV;
+        const float rawCmPerSec = (rev * wheelCircumference) / dt;
+
+        measuredWheelSpeed[i] =
+            (1.0f - SPEED_FILTER_ALPHA) * measuredWheelSpeed[i] +
+            SPEED_FILTER_ALPHA * rawCmPerSec;
+    }
+}
+
+void updateEncoderTelemetry() {
+    const uint32_t now = millis();
+    const uint32_t elapsedMs = now - lastTelemetryMs;
+    if (elapsedMs < ENCODER_TELEMETRY_MS) return;
+
+    int32_t current[MOTOR_COUNT];
+    snapshotEncoderCounts(current);
+
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        const int32_t delta = current[i] - previousTelemetryCounts[i];
+        previousTelemetryCounts[i] = current[i];
+
+        encoderRpm[i] =
+            ((float)delta * 60000.0f) /
+            (COUNTS_PER_OUTPUT_REV * (float)elapsedMs);
+    }
+
+    lastTelemetryMs = now;
+}
+
+// =====================================================
+// 7) OMNI KINEMATICS / PID
+// =====================================================
+
+void inverseKinematics(float vx, float vy, float w, float out[MOTOR_COUNT]) {
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        const float a = WHEEL_ANGLE_DEG[i] * (float)M_PI / 180.0f;
+        out[i] = -sinf(a) * vx + cosf(a) * vy + ROBOT_RADIUS_CM * w;
+    }
+
+    float maxAbs = 0.0f;
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        maxAbs = fmaxf(maxAbs, fabsf(out[i]));
+    }
+
+    if (maxAbs > MAX_WHEEL_SPEED_CM_S) {
+        const float scale = MAX_WHEEL_SPEED_CM_S / maxAbs;
+        for (uint8_t i = 0; i < MOTOR_COUNT; i++) out[i] *= scale;
+    }
+}
+
+void runWheelPid(float dt) {
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        const float error = targetWheelSpeed[i] - measuredWheelSpeed[i];
+        const float p = PID_KP * error;
+        const float d = PID_KD * (error - pidPreviousError[i]) / dt;
+        pidPreviousError[i] = error;
+
+        const float candidateIntegral = pidIntegral[i] + error * dt;
+        float iTerm = PID_KI * candidateIntegral;
+        float output = p + iTerm + d;
+
+        // anti-windup
+        if (output > -PWM_MAX && output < PWM_MAX) {
+            pidIntegral[i] = candidateIntegral;
+        } else {
+            iTerm = PID_KI * pidIntegral[i];
+            output = p + iTerm + d;
+        }
+
+        // 정지 목표에서는 잔류 적분 제거
+        if (fabsf(targetWheelSpeed[i]) < 0.3f) {
+            pidIntegral[i] *= 0.80f;
+            if (fabsf(measuredWheelSpeed[i]) < 0.8f) output = 0.0f;
+        }
+
+        output = constrain(output, -(float)PWM_MAX, (float)PWM_MAX);
+        int pwm = (int)lroundf(output);
+        if (pwm != 0 && abs(pwm) < PWM_MIN_MOVE) {
+            pwm = pwm > 0 ? PWM_MIN_MOVE : -PWM_MIN_MOVE;
+        }
+        writeMotorPwm(i, pwm, false);
+    }
+}
+
+// =====================================================
+// 8) UDP COMMAND SAFETY / RECEIVE
+// =====================================================
+
+bool isValidStatus(const String &status) {
+    return status == "RUN" || status == "SLOW" || status == "STOP";
+}
+
+float clampMagnitude(float value, float limit) {
+    if (value > limit) return limit;
+    if (value < -limit) return -limit;
+    return value;
+}
+
+void applySlowCaps(float &vx, float &vy, float &w) {
+    const float linear = hypotf(vx, vy);
+    if (linear > SLOW_MAX_LINEAR_CM_S && linear > 1e-6f) {
+        const float k = SLOW_MAX_LINEAR_CM_S / linear;
+        vx *= k;
+        vy *= k;
+    }
+    w = clampMagnitude(w, SLOW_MAX_ANGULAR_RAD_S);
+}
+
+void failClosedStop(const char *reason) {
+    cmdVx = 0.0f;
+    cmdVy = 0.0f;
+    cmdW = 0.0f;
+    cmdStatus = "STOP";
+    if (controlMode == MODE_NETWORK) {
+        stopAllMotors(false);
+    }
+    Serial.print("[SAFETY] network command rejected: ");
+    Serial.println(reason);
+}
+
+void receiveUdpCommands() {
+    if (!udpStarted) return;
+
+    int packetSize = udp.parsePacket();
+    while (packetSize > 0) {
+        const int len = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
+        if (len > 0) {
+            packetBuffer[len] = '\0';
+
+            JsonDocument doc;
+            const DeserializationError error = deserializeJson(doc, packetBuffer);
+
+            if (error) {
+                failClosedStop("invalid JSON");
+            } else {
+                const char *statusC = doc["status"] | "";
+                String status(statusC);
+                status.toUpperCase();
+
+                if (!isValidStatus(status)) {
+                    failClosedStop("invalid status");
+                } else {
+                    float vx = doc["vx"] | 0.0f;
+                    float vy = doc["vy"] | 0.0f;
+                    float w = doc["w"] | 0.0f;
+
+                    // NaN/Inf 방어
+                    if (!isfinite(vx) || !isfinite(vy) || !isfinite(w)) {
+                        failClosedStop("non-finite command");
+                    } else {
+                        vx = clampMagnitude(vx, MAX_CMD_LINEAR_CM_S);
+                        vy = clampMagnitude(vy, MAX_CMD_LINEAR_CM_S);
+                        w = clampMagnitude(w, MAX_CMD_ANGULAR_RAD_S);
+
+                        if (status == "SLOW") applySlowCaps(vx, vy, w);
+                        if (status == "STOP") vx = vy = w = 0.0f;
+
+                        cmdVx = vx;
+                        cmdVy = vy;
+                        cmdW = w;
+                        cmdStatus = status;
+                        lastSeq = doc["seq"] | -1;
+                        lastCommandMs = millis();
+                    }
+                }
+            }
+        }
+
+        // backlog가 있으면 가장 최신 packet까지 모두 소비
+        packetSize = udp.parsePacket();
+    }
+}
+
+// =====================================================
+// 9) NETWORK CONTROL LOOP
+// =====================================================
+
+void updateNetworkControl() {
+    if (controlMode != MODE_NETWORK) return;
+
+    const uint32_t now = millis();
+    if ((now - lastControlMs) < CONTROL_PERIOD_MS) return;
+
+    float dt = (now - lastControlMs) / 1000.0f;
+    if (dt <= 0.0f) dt = CONTROL_PERIOD_MS / 1000.0f;
+    lastControlMs = now;
+
+    updateWheelSpeedForControl(dt);
+
+    const bool wifiDown = WiFi.status() != WL_CONNECTED;
+    const bool timedOut = (lastCommandMs == 0) || ((now - lastCommandMs) > CMD_TIMEOUT_MS);
+    const bool stopStatus = cmdStatus == "STOP";
+    const bool shouldStop = wifiDown || timedOut || stopStatus;
+
+    if (shouldStop != networkStopped) {
+        networkStopped = shouldStop;
+        Serial.print("[NETWORK] ");
+        Serial.print(networkStopped ? "STOP" : "RUN");
+        Serial.print(" timeout=");
+        Serial.print(timedOut);
+        Serial.print(" wifiDown=");
+        Serial.print(wifiDown);
+        Serial.print(" status=");
+        Serial.println(cmdStatus);
+    }
+
+    if (shouldStop) {
+        stopAllMotors(false);
+        return;
+    }
+
+    float wheelTargets[MOTOR_COUNT];
+    inverseKinematics(cmdVx, cmdVy, cmdW, wheelTargets);
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        targetWheelSpeed[i] = wheelTargets[i];
+    }
+
+    runWheelPid(dt);
+}
+
+// =====================================================
+// 10) WI-FI
+// =====================================================
+
+void startUdpIfNeeded() {
+    if (WiFi.status() == WL_CONNECTED && !udpStarted) {
+        if (udp.begin(UDP_PORT)) {
+            udpStarted = true;
+            Serial.print("[UDP] listening on port ");
+            Serial.println(UDP_PORT);
+        }
+    }
+}
+
+void beginWiFi() {
+    WiFi.mode(WIFI_STA);
+
+    if (USE_STATIC_IP) {
+        if (!WiFi.config(LOCAL_IP, GATEWAY, SUBNET, DNS1)) {
+            Serial.println("[WiFi] static IP configuration failed");
+        }
+    }
+
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    lastWifiRetryMs = millis();
+    Serial.print("[WiFi] connecting to ");
+    Serial.println(WIFI_SSID);
+}
+
+void maintainWiFi() {
+    if (WiFi.status() == WL_CONNECTED) {
+        startUdpIfNeeded();
+        return;
+    }
+
+    if (udpStarted) {
+        udp.stop();
+        udpStarted = false;
+    }
+
+    const uint32_t now = millis();
+    if ((now - lastWifiRetryMs) >= WIFI_RETRY_MS) {
+        lastWifiRetryMs = now;
+        Serial.println("[WiFi] reconnecting...");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+}
+
+// =====================================================
+// 11) SERIAL DEBUG / MANUAL COMMANDS
+// =====================================================
+
+void printEncoderStatus() {
+    int32_t counts[MOTOR_COUNT];
+    snapshotEncoderCounts(counts);
+
+    Serial.println();
+    Serial.println("===== ENCODER =====");
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        printMotorName(i);
+        Serial.print(" Count=");
+        Serial.print(counts[i]);
+        Serial.print(" RPM=");
+        Serial.print(encoderRpm[i], 2);
+        Serial.print(" speed=");
+        Serial.print(measuredWheelSpeed[i], 2);
+        Serial.println(" cm/s");
+    }
+    Serial.print("COUNTS/REV=");
+    Serial.println(COUNTS_PER_OUTPUT_REV, 2);
+    Serial.println("===================");
+}
+
+void printStatus() {
+    Serial.println();
+    Serial.println("===== STATUS =====");
+    Serial.print("MODE = ");
+    Serial.println(controlMode == MODE_NETWORK ? "NETWORK" : "MANUAL_PWM");
+
+    Serial.print("WiFi = ");
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("CONNECTED  IP=");
+        Serial.println(WiFi.localIP());
     } else {
-      iTerm = KI * integral[i];  // 포화 -> 직전 적분 유지
-      total = p + iTerm + d;
+        Serial.println("DISCONNECTED");
     }
 
-    // 목표가 0이면 적분을 빠르게 털어낸다 (정지 후 슬금슬금 움직이는 것 방지)
-    if (fabsf(targetSpeed[i]) < 0.5f) {
-      integral[i] *= 0.85f;
-      if (fabsf(measSpeed[i]) < 1.0f) total = 0.0f;
+    Serial.print("UDP = ");
+    Serial.println(udpStarted ? "ON" : "OFF");
+
+    Serial.print("cmd = (");
+    Serial.print(cmdVx, 1);
+    Serial.print(", ");
+    Serial.print(cmdVy, 1);
+    Serial.print(", ");
+    Serial.print(cmdW, 2);
+    Serial.print(") status=");
+    Serial.print(cmdStatus);
+    Serial.print(" seq=");
+    Serial.println(lastSeq);
+
+    const uint32_t age = lastCommandMs == 0 ? 0xFFFFFFFFUL : millis() - lastCommandMs;
+    Serial.print("command age ms = ");
+    if (lastCommandMs == 0) Serial.println("NONE");
+    else Serial.println(age);
+
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        printMotorName(i);
+        Serial.print(" target=");
+        Serial.print(targetWheelSpeed[i], 2);
+        Serial.print(" cm/s measured=");
+        Serial.print(measuredWheelSpeed[i], 2);
+        Serial.print(" pwm=");
+        Serial.println(motors[i].currentPwm);
     }
 
-    if (total >  PWM_MAX) total =  PWM_MAX;
-    if (total < -PWM_MAX) total = -PWM_MAX;
-
-    motorWrite(i, total);
-  }
+    Serial.println("==================");
 }
 
-// ============================================================
-// 9. setup / loop
-// ============================================================
+void printPinMap() {
+    Serial.println();
+    Serial.println("===== PIN MAP =====");
+    Serial.println("STBY=27");
+    Serial.println("M1 IN1=19 IN2=18 PWM=25 ENC_A=34 ENC_B=35");
+    Serial.println("M2 IN1=21 IN2=22 PWM=26 ENC_A=16 ENC_B=17");
+    Serial.println("M3 IN1=23 IN2=13 PWM=14 ENC_A=32 ENC_B=33");
+    Serial.println("===================");
+}
+
+void printHelp() {
+    Serial.println();
+    Serial.println("===== COMMANDS =====");
+    Serial.println("AUTO                -> network control mode");
+    Serial.println("M1 100              -> manual PWM mode");
+    Serial.println("M2 -100");
+    Serial.println("M3 100");
+    Serial.println("ALL 100 100 100     -> manual PWM mode");
+    Serial.println("STOP                -> manual STOP; use AUTO to resume network");
+    Serial.println("ENC");
+    Serial.println("ZERO");
+    Serial.println("STREAM ON");
+    Serial.println("STREAM OFF");
+    Serial.println("STATUS");
+    Serial.println("PIN");
+    Serial.println("HELP");
+    Serial.println("====================");
+}
+
+void handleSingleMotorCommand(const String &command) {
+    int motorNumber = 0;
+    int pwm = 0;
+    if (sscanf(command.c_str(), "M%d %d", &motorNumber, &pwm) != 2) {
+        Serial.println("ERROR: use M1 100");
+        return;
+    }
+    if (motorNumber < 1 || motorNumber > 3) {
+        Serial.println("ERROR: motor must be 1~3");
+        return;
+    }
+
+    if (controlMode != MODE_MANUAL_PWM) {
+        stopAllMotors(false);
+    }
+    controlMode = MODE_MANUAL_PWM;
+    resetPidState();
+    writeMotorPwm((uint8_t)(motorNumber - 1), pwm, true);
+    Serial.println("[MODE] MANUAL_PWM");
+}
+
+void handleAllMotorCommand(const String &command) {
+    int m1 = 0, m2 = 0, m3 = 0;
+    if (sscanf(command.c_str(), "ALL %d %d %d", &m1, &m2, &m3) != 3) {
+        Serial.println("ERROR: use ALL 100 100 100");
+        return;
+    }
+    setAllMotorsManual(m1, m2, m3);
+    resetPidState();
+    Serial.println("[MODE] MANUAL_PWM");
+}
+
+void enterNetworkMode() {
+    stopAllMotors(false);
+    controlMode = MODE_NETWORK;
+    cmdVx = cmdVy = cmdW = 0.0f;
+    cmdStatus = "STOP";
+    lastCommandMs = 0; // 반드시 새 packet을 받아야 재주행
+    networkStopped = true;
+
+    int32_t current[MOTOR_COUNT];
+    snapshotEncoderCounts(current);
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        previousControlCounts[i] = current[i];
+        pidIntegral[i] = 0.0f;
+        pidPreviousError[i] = 0.0f;
+    }
+    lastControlMs = millis();
+
+    Serial.println("[MODE] NETWORK - waiting for a fresh UDP command");
+}
+
+void handleSerialCommand() {
+    if (Serial.available() <= 0) return;
+
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toUpperCase();
+    if (command.length() == 0) return;
+
+    if (command.startsWith("M1 ") || command.startsWith("M2 ") || command.startsWith("M3 ")) {
+        handleSingleMotorCommand(command);
+    } else if (command.startsWith("ALL ")) {
+        handleAllMotorCommand(command);
+    } else if (command == "STOP") {
+        controlMode = MODE_MANUAL_PWM;
+        stopAllMotors(true);
+        Serial.println("[MODE] MANUAL_PWM. Send AUTO to resume network control.");
+    } else if (command == "AUTO") {
+        enterNetworkMode();
+    } else if (command == "ENC") {
+        printEncoderStatus();
+    } else if (command == "ZERO") {
+        zeroEncoders();
+    } else if (command == "STREAM ON") {
+        streamEnabled = true;
+        Serial.println("Encoder stream ON");
+    } else if (command == "STREAM OFF") {
+        streamEnabled = false;
+        Serial.println("Encoder stream OFF");
+    } else if (command == "STATUS") {
+        printStatus();
+    } else if (command == "PIN") {
+        printPinMap();
+    } else if (command == "HELP") {
+        printHelp();
+    } else {
+        Serial.println("Unknown command. Send HELP.");
+    }
+}
+
+// =====================================================
+// 12) INITIALIZATION
+// =====================================================
+
+bool initializeMotor(Motor &motor) {
+    pinMode(motor.in1, OUTPUT);
+    pinMode(motor.in2, OUTPUT);
+    digitalWrite(motor.in1, LOW);
+    digitalWrite(motor.in2, LOW);
+
+    const bool attached = ledcAttach(motor.pwmPin, PWM_FREQUENCY, PWM_RESOLUTION);
+    if (!attached) return false;
+
+    ledcWrite(motor.pwmPin, 0);
+    motor.currentPwm = 0;
+    return true;
+}
+
+void initializeEncoders() {
+    // GPIO34/35: internal pull-up 없음
+    pinMode(M1_ENC_A, INPUT);
+    pinMode(M1_ENC_B, INPUT);
+
+    pinMode(M2_ENC_A, INPUT_PULLUP);
+    pinMode(M2_ENC_B, INPUT_PULLUP);
+    pinMode(M3_ENC_A, INPUT_PULLUP);
+    pinMode(M3_ENC_B, INPUT_PULLUP);
+
+    attachInterrupt(digitalPinToInterrupt(M1_ENC_A), encoder1ISR, RISING);
+    attachInterrupt(digitalPinToInterrupt(M2_ENC_A), encoder2ISR, RISING);
+    attachInterrupt(digitalPinToInterrupt(M3_ENC_A), encoder3ISR, RISING);
+
+    zeroEncoders();
+}
+
 void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println("\n=== D.I.G ESP32 옴니 제어기 ===");
+    Serial.begin(SERIAL_BAUD);
+    Serial.setTimeout(30);
+    delay(400);
 
-  // --- 핀 초기화 (모터를 먼저 정지 상태로 만든 뒤 WiFi를 붙인다) ---
-  for (int i = 0; i < 3; i++) {
-    pinMode(PIN_IN1[i], OUTPUT);
-    pinMode(PIN_IN2[i], OUTPUT);
-    pwmSetup(i, PIN_PWM[i]);
+    pinMode(PIN_STBY, OUTPUT);
+    digitalWrite(PIN_STBY, LOW);
 
-    pinMode(PIN_ENC_A[i], INPUT_PULLUP);
-    pinMode(PIN_ENC_B[i], INPUT_PULLUP);
-  }
-  stopAllMotors();
+    bool ok = true;
+    for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+        if (!initializeMotor(motors[i])) {
+            Serial.print("ERROR: M");
+            Serial.print(i + 1);
+            Serial.println(" PWM initialization failed");
+            ok = false;
+        }
+    }
 
-  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A[0]), encISR0, RISING);
-  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A[1]), encISR1, RISING);
-  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A[2]), encISR2, RISING);
+    if (!ok) {
+        digitalWrite(PIN_STBY, LOW);
+        Serial.println("Motor driver disabled due to PWM init failure");
+        while (true) delay(1000);
+    }
 
-  // --- WiFi ---
-  WiFi.mode(WIFI_STA);
-  if (!WiFi.config(LOCAL_IP, GATEWAY, SUBNET)) {
-    Serial.println("[WiFi] 고정 IP 설정 실패");
-  }
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("[WiFi] 연결 중");
+    initializeEncoders();
 
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-    delay(300);
-    Serial.print(".");
-  }
+    // 모든 PWM=0 확인 후 TB6612 활성화
+    digitalWrite(PIN_STBY, HIGH);
+    stopAllMotors(false);
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] 연결됨. IP=%s\n", WiFi.localIP().toString().c_str());
-    udp.begin(UDP_PORT);
-    Serial.printf("[UDP] %d 포트 수신 대기\n", UDP_PORT);
-  } else {
-    Serial.println("\n[WiFi] 연결 실패 - 모터는 정지 상태로 유지됩니다.");
-  }
+    beginWiFi();
 
-  // WiFi가 붙어도 PC 패킷이 오기 전까지는 정지 상태를 유지한다.
-  last_cmd_ms = 0;
-  lastControlMs = millis();
+    Serial.println();
+    Serial.println("============================================");
+    Serial.println("D.I.G / GRISE Wi-Fi omni controller ready");
+    Serial.println("Default mode: NETWORK");
+    Serial.println("UDP JSON: {seq,vx,vy,w,status}");
+    Serial.println("Port: 8888 / watchdog: 300 ms");
+    Serial.println("Send HELP for serial debug commands");
+    Serial.println("============================================");
 }
+
+// =====================================================
+// 13) MAIN LOOP
+// =====================================================
 
 void loop() {
-  // --- 1) 수신 ---
-  receiveCommand();
+    handleSerialCommand();
+    maintainWiFi();
+    receiveUdpCommands();
 
-  // --- 2) 안전 판정 (★ 필수 안전장치 ★) ---
-  uint32_t now = millis();
-  bool timedOut = (last_cmd_ms == 0) || ((now - last_cmd_ms) > CMD_TIMEOUT_MS);
-  bool wifiDown = (WiFi.status() != WL_CONNECTED);
-  bool stopCmd  = (cmd_status == "STOP");
+    updateEncoderTelemetry();
+    updateNetworkControl();
 
-  bool shouldStop = timedOut || wifiDown || stopCmd;
-
-  if (shouldStop != estopped) {
-    estopped = shouldStop;
-    Serial.printf("[안전] %s  (timeout=%d wifi_down=%d stop_cmd=%d)\n",
-                  estopped ? "정지" : "주행 재개",
-                  timedOut, wifiDown, stopCmd);
-  }
-
-  // --- 3) 제어 주기 ---
-  if (now - lastControlMs < CONTROL_PERIOD_MS) return;
-  float dt = (now - lastControlMs) / 1000.0f;
-  lastControlMs = now;
-
-  updateSpeeds(dt);
-
-  if (estopped) {
-    stopAllMotors();
-  } else {
-    // 역기구학: 몸체 속도 -> 바퀴별 목표 선속도
-    float wheels[3];
-    inverseKinematics(cmd_vx, cmd_vy, cmd_w, wheels);
-    for (int i = 0; i < 3; i++) targetSpeed[i] = wheels[i];
-
-    runPID(dt);
-  }
-
-  // --- 4) 상태 로그 (1초에 한 번) ---
-  if (now - lastStatusMs > 1000) {
-    lastStatusMs = now;
-    Serial.printf(
-      "[%s] cmd(%.1f, %.1f, %.2f) tgt(%.1f %.1f %.1f) meas(%.1f %.1f %.1f) seq=%ld\n",
-      estopped ? "STOP" : cmd_status.c_str(),
-      cmd_vx, cmd_vy, cmd_w,
-      targetSpeed[0], targetSpeed[1], targetSpeed[2],
-      measSpeed[0], measSpeed[1], measSpeed[2],
-      (long)last_seq);
-  }
+    if (streamEnabled && (millis() - lastStatusPrintMs) >= 1000) {
+        lastStatusPrintMs = millis();
+        printStatus();
+    }
 }

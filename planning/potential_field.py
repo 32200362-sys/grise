@@ -101,26 +101,29 @@ class PotentialField:
         rx, ry = robot.x_cm, robot.y_cm
 
         # ---------- 인력 ----------
+        # IDLE_UNTIL_THREAT 모드에서는 목표로 끌려가지 않는다 - 평소엔 제자리 대기,
+        # 아래 척력만으로 위험할 때만 물러난다.
         fx_att = fy_att = 0.0
         if cup is not None:
             result.has_goal = True
-            dx = cup.x_cm - rx
-            dy = cup.y_cm - ry
-            dist = math.hypot(dx, dy)
-            result.goal_distance_cm = dist
+            if not config.IDLE_UNTIL_THREAT:
+                dx = cup.x_cm - rx
+                dy = cup.y_cm - ry
+                dist = math.hypot(dx, dy)
+                result.goal_distance_cm = dist
 
-            if dist < config.PF_GOAL_TOLERANCE_CM:
-                result.goal_reached = True
-            elif dist > 1e-6:
-                if dist <= config.PF_ATTRACT_MAX_CM:
-                    # quadratic well: 가까울수록 부드럽게 감속
-                    fx_att = config.PF_K_ATTRACT * dx
-                    fy_att = config.PF_K_ATTRACT * dy
-                else:
-                    # conic well: 멀면 일정한 크기로
-                    m = config.PF_K_ATTRACT * config.PF_ATTRACT_MAX_CM
-                    fx_att = m * dx / dist
-                    fy_att = m * dy / dist
+                if dist < config.PF_GOAL_TOLERANCE_CM:
+                    result.goal_reached = True
+                elif dist > 1e-6:
+                    if dist <= config.PF_ATTRACT_MAX_CM:
+                        # quadratic well: 가까울수록 부드럽게 감속
+                        fx_att = config.PF_K_ATTRACT * dx
+                        fy_att = config.PF_K_ATTRACT * dy
+                    else:
+                        # conic well: 멀면 일정한 크기로
+                        m = config.PF_K_ATTRACT * config.PF_ATTRACT_MAX_CM
+                        fx_att = m * dx / dist
+                        fy_att = m * dy / dist
 
         # ---------- 척력: 장애물 ----------
         fx_rep = fy_rep = 0.0
@@ -154,8 +157,10 @@ class PotentialField:
         f_mag = math.hypot(fx, fy)
 
         # ---------- 지역 최소점 탈출 ----------
+        # 목표로 이동하지 않는 IDLE_UNTIL_THREAT 모드에서는 애초에 갇힐 목표가 없다.
         if (
-            result.has_goal
+            not config.IDLE_UNTIL_THREAT
+            and result.has_goal
             and not result.goal_reached
             and f_mag < config.PF_LOCAL_MINIMA_FORCE
         ):
@@ -187,9 +192,13 @@ class PotentialField:
                 vy *= k
 
         # ---------- 위험 등급별 감속 ----------
-        risk_scale = config.SPEED_SCALE_BY_RISK.get(risk_level, 0.0)
-        vx *= risk_scale
-        vy *= risk_scale
+        # IDLE_UNTIL_THREAT 모드에서는 위험할수록 오히려 더 움직여야(물러나야) 하므로
+        # 여기서 속도를 깎지 않는다. 위험도에 따른 긴급도는 이미 위 척력 계산에서
+        # PF_HUMAN_GAIN_BY_RISK로 반영됐다 (SAFE 1.0 / WARN 1.8 / DANGER 3.0).
+        if not config.IDLE_UNTIL_THREAT:
+            risk_scale = config.SPEED_SCALE_BY_RISK.get(risk_level, 0.0)
+            vx *= risk_scale
+            vy *= risk_scale
 
         # ---------- 가속도 제한 ----------
         vx, vy = self._limit_accel(vx, vy, now)
