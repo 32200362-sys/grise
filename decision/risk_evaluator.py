@@ -1,15 +1,29 @@
 """
-판단 계층 - 사람 손이 컵에 위험하게 접근하는지 판정.
+판단 계층 - 사람 손이 컵에 "정상적으로 집으러" 오는지, 아니면 "위험하게(치듯)"
+접근하는지 판정.
 
-판정 입력
+★ 핵심 설계 ★
+  그립(집기 자세)이 감지되면 정상적인 픽업으로 보고 회피하지 않는다(SAFE 고정).
+  그립이 아닌 채로 접근하면(편 손/주먹으로 빠르게 다가오는 등 - 치려는 행위로
+  간주) 아래 운동학 규칙으로 DANGER/WARN을 판정한다.
+
+  이건 "의도 신호는 위험판정을 절대 뒤집지 않는다"는 예전 설계와 정반대다.
+  하지만 실패 방향이 안전하다: 그립 인식이 실패하면(손이 가려짐 등) "그립 아님"
+  분기로 떨어져서 오히려 더 보수적으로(회피 쪽으로) 판정한다. 즉 그립 인식이
+  조용히 실패해도 위험판정이 침묵하는 게 아니라 반대로 더 조심하게 된다.
+  시선(gaze)은 그립만큼 신뢰할 수 없어서(치려는 손도 컵을 쳐다볼 수 있음)
+  이 판정을 뒤집는 데 쓰지 않고, 기존처럼 임계값만 살짝 넓히는 보조 신호로만 쓴다.
+
+판정 입력 (그립이 아닐 때)
   - 손목-컵 거리 d [cm]          : 두 손목 중 더 가까운 쪽
   - 접근 속도 v = -dd/dt [cm/s]  : 양수면 가까워지는 중
   - 충돌 예상 시간 TTC = d / v [s]
 
 판정 규칙 (위에서부터 먼저 걸리는 것 적용)
-  DANGER : d < RISK_DANGER_DIST_CM
+  SAFE   : 그립(집기 자세) 감지됨 - 정상 픽업으로 간주, 무조건 SAFE
+  DANGER : (그립 아님) d < RISK_DANGER_DIST_CM
            또는 (v > 임계) and (TTC < RISK_TTC_DANGER_S)
-  WARN   : d < RISK_WARN_DIST_CM
+  WARN   : (그립 아님) d < RISK_WARN_DIST_CM
            또는 (v > 임계) and (TTC < RISK_TTC_WARN_S)
   SAFE   : 그 외
 
@@ -38,7 +52,7 @@ class RiskState:
     ttc_s: float | None = None           # 충돌 예상 시간
     reason: str = "no-data"
 
-    # 의도 신호 (판정 자체를 뒤집지는 않고 임계값만 넓힌다)
+    # 의도 신호 (grip은 SAFE로 판정을 뒤집는다, gaze는 임계값만 넓힌다)
     intent: bool = False
     intent_grip: bool = False
     intent_gaze: bool = False
@@ -91,7 +105,8 @@ class RiskEvaluator:
         hands      : perception.HandsResult | None  (그립 모양 - 의도 신호)
         gaze       : perception.GazeInfo | None     (머리 방향 - 의도 신호)
 
-        hands/gaze는 임계값을 넓히는 데만 쓰인다. 이것만으로 DANGER가 되지는 않는다.
+        grip이 감지되면(집으려는 자세) 무조건 SAFE로 판정해 회피하지 않는다.
+        grip이 아닐 때는 gaze가 임계값만 넓히는 보조 신호로 쓰인다.
         """
         now = time.time() if now is None else now
 
@@ -140,41 +155,42 @@ class RiskEvaluator:
         # --- TTC ---
         ttc = dist / speed if speed > 1.0 else None
 
-        # --- 의도 신호로 임계값을 넓힌다 (판정 규칙 자체는 그대로) ---
-        d_boost = config.INTENT_DIST_BOOST if intent else 1.0
-        t_boost = config.INTENT_TTC_BOOST if intent else 1.0
-        danger_dist = config.RISK_DANGER_DIST_CM * d_boost
-        warn_dist = config.RISK_WARN_DIST_CM * d_boost
-        ttc_danger = config.RISK_TTC_DANGER_S * t_boost
-        ttc_warn = config.RISK_TTC_WARN_S * t_boost
+        # --- 그립(집기 자세) 감지 시: 정상적인 픽업으로 보고 회피하지 않는다 ---
+        if grip_on:
+            level, reason = "SAFE", "grasp (picking up)"
+        else:
+            # 그립이 아닐 때만 운동학 규칙으로 판정한다.
+            # 시선은 그립만큼 신뢰할 수 없으므로(치려는 손도 컵을 볼 수 있음)
+            # 판정을 뒤집진 않고 임계값만 살짝 넓히는 보조 신호로만 쓴다.
+            d_boost = config.INTENT_DIST_BOOST if gaze_on else 1.0
+            t_boost = config.INTENT_TTC_BOOST if gaze_on else 1.0
+            danger_dist = config.RISK_DANGER_DIST_CM * d_boost
+            warn_dist = config.RISK_WARN_DIST_CM * d_boost
+            ttc_danger = config.RISK_TTC_DANGER_S * t_boost
+            ttc_warn = config.RISK_TTC_WARN_S * t_boost
 
-        # --- 규칙 판정 (reason은 영문 고정 - 위 주석 참고) ---
-        level, reason = "SAFE", "normal"
+            # --- 규칙 판정 (reason은 영문 고정 - 위 주석 참고) ---
+            level, reason = "SAFE", "normal"
 
-        if dist < danger_dist:
-            level, reason = "DANGER", f"close {dist:.0f}cm"
-        elif (
-            speed > config.RISK_APPROACH_SPEED_CM_S
-            and ttc is not None
-            and ttc < ttc_danger
-        ):
-            level, reason = "DANGER", f"fast approach TTC {ttc:.2f}s"
-        elif dist < warn_dist:
-            level, reason = "WARN", f"approaching {dist:.0f}cm"
-        elif (
-            speed > config.RISK_APPROACH_SPEED_CM_S
-            and ttc is not None
-            and ttc < ttc_warn
-        ):
-            level, reason = "WARN", f"approaching TTC {ttc:.2f}s"
+            if dist < danger_dist:
+                level, reason = "DANGER", f"close {dist:.0f}cm (no grasp)"
+            elif (
+                speed > config.RISK_APPROACH_SPEED_CM_S
+                and ttc is not None
+                and ttc < ttc_danger
+            ):
+                level, reason = "DANGER", f"fast approach TTC {ttc:.2f}s (no grasp)"
+            elif dist < warn_dist:
+                level, reason = "WARN", f"approaching {dist:.0f}cm (no grasp)"
+            elif (
+                speed > config.RISK_APPROACH_SPEED_CM_S
+                and ttc is not None
+                and ttc < ttc_warn
+            ):
+                level, reason = "WARN", f"approaching TTC {ttc:.2f}s (no grasp)"
 
-        if intent and level != "SAFE":
-            tags = []
-            if grip_on:
-                tags.append("grip")
-            if gaze_on:
-                tags.append("gaze")
-            reason += f" +{'/'.join(tags)}"
+            if gaze_on and level != "SAFE":
+                reason += " +gaze"
 
         state = RiskState(
             level=level,

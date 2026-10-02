@@ -137,6 +137,19 @@ def step(pf, robot, cup, obstacles, human, risk, dt=0.05, n=1):
 
 pf = PotentialField()
 robot = FakeRobot(0, 0, 0)
+
+# 대기 모드(SEEK_CUP=False): SAFE면 컵이 있어도, 사람이 근처에 있어도 가만히 있는다.
+config.SEEK_CUP = False
+pf.reset()
+r = step(pf, robot, FakeDet(100.0, 0.0), [], FakeHuman(joints=[FakeJoint(0.0, 20.0)]), "SAFE", n=20)
+check("대기 모드 SAFE -> 정지", r.speed < 1e-6, f"speed={r.speed:.2f}")
+pf.reset()
+r = step(pf, robot, FakeDet(100.0, 0.0), [], FakeHuman(joints=[FakeJoint(0.0, 20.0)]), "DANGER", n=40)
+check("대기 모드 DANGER -> 반대방향(-Y)으로 회피", r.vy_world < 0 and r.speed > 1.0,
+      f"v=({r.vx_world:.2f},{r.vy_world:.2f})")
+
+# 아래 테스트는 컵 추적 동작(SEEK_CUP=True) 검증
+config.SEEK_CUP = True
 cup = FakeDet(100.0, 0.0)                       # 로봇 정동쪽 1m
 r = step(pf, robot, cup, [], EMPTY_HUMAN, "SAFE", n=40)
 check("장애물 없음 -> 컵 방향(+X)으로 이동", r.vx_world > 5 and abs(r.vy_world) < 1e-6,
@@ -173,7 +186,11 @@ check("WARN에서 회피 각도가 더 큼", ratio_warn > ratio_safe, f"safe={ra
 
 pf.reset()
 r = step(pf, robot, cup, [], human_above, "DANGER", n=40)
-check("DANGER -> 속도 0", r.speed < 1e-6, f"speed={r.speed:.2f}")
+# DANGER에서는 인력을 끄고 척력만 작동시킨다 - 사람이 실제로 가까우면(여기서는 20cm,
+# 영향반경 안) 그 반대 방향(-Y)으로 물러나야 한다. 얼어붙어 정지하는 게 아니다.
+check("DANGER -> 인력 꺼짐, 척력만으로 반대방향(-Y) 회피",
+      r.vy_world < 0 and r.speed > 1.0 and abs(r.vx_world) < 1e-6,
+      f"speed={r.speed:.2f} v=({r.vx_world:.2f},{r.vy_world:.2f})")
 
 # --- 장애물 회피: 여기가 게인 스케일 버그가 나는 자리다 ---
 # 척력 게인이 인력에 비해 너무 작으면 로봇이 장애물을 뚫고 전속력으로 돌진한다.

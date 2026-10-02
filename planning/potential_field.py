@@ -101,12 +101,17 @@ class PotentialField:
         rx, ry = robot.x_cm, robot.y_cm
 
         # ---------- 인력 ----------
-        # IDLE_UNTIL_THREAT 모드에서는 목표로 끌려가지 않는다 - 평소엔 제자리 대기,
-        # 아래 척력만으로 위험할 때만 물러난다.
+        # DANGER일 때는 목표로 끌려가지 않는다. 그렇지 않으면 사람 손이 멀리서
+        # 빠르게 접근해(TTC 트리거) 아직 척력 영향반경(PF_HUMAN_INFLUENCE_CM) 밖이라
+        # 척력이 0인 순간, 인력만 남아 로봇이 위험한 방향(컵=사람 손 근처)으로
+        # 오히려 전속력 돌진하게 된다. 그래서 DANGER는 "인력을 꺼서 최악의 경우
+        # 제자리에 멈추거나(척력도 0), 실제로 가까우면 척력만으로 물러나게" 만든다.
+        # SAFE/WARN에서는 평소대로 컵으로 접근한다 - 그래야 위험이 사라졌을 때
+        # 다시 컵을 나르는 원래 목적을 수행할 수 있다.
         fx_att = fy_att = 0.0
         if cup is not None:
             result.has_goal = True
-            if not config.IDLE_UNTIL_THREAT:
+            if config.SEEK_CUP and risk_level != "DANGER":
                 dx = cup.x_cm - rx
                 dy = cup.y_cm - ry
                 dist = math.hypot(dx, dy)
@@ -157,9 +162,10 @@ class PotentialField:
         f_mag = math.hypot(fx, fy)
 
         # ---------- 지역 최소점 탈출 ----------
-        # 목표로 이동하지 않는 IDLE_UNTIL_THREAT 모드에서는 애초에 갇힐 목표가 없다.
+        # DANGER일 때는 애초에 인력이 꺼져 있어 "목표로 가다가 갇힌" 상황 자체가 아니다.
         if (
-            not config.IDLE_UNTIL_THREAT
+            config.SEEK_CUP
+            and risk_level != "DANGER"
             and result.has_goal
             and not result.goal_reached
             and f_mag < config.PF_LOCAL_MINIMA_FORCE
@@ -180,7 +186,10 @@ class PotentialField:
         # 고정 게인으로 변환한 뒤 clamp 한다.
         # 힘을 항상 최대속도로 정규화하면, 장애물 척력으로 합력이 줄어들어도
         # 여전히 전속력이 나와서 "감속하며 접근"이라는 동작 자체가 사라진다.
-        if result.goal_reached or f_mag < 1e-6:
+        # SEEK_CUP=False면 SAFE에선 가만히 있는다 - 근처에 사람이 있어 약한 척력이
+        # 생겨도 위험 판정 전까지는 움직이지 않는다.
+        idle = not config.SEEK_CUP and risk_level == "SAFE"
+        if idle or result.goal_reached or f_mag < 1e-6:
             vx = vy = 0.0
         else:
             vx = fx * config.PF_FORCE_TO_SPEED
@@ -191,14 +200,13 @@ class PotentialField:
                 vx *= k
                 vy *= k
 
-        # ---------- 위험 등급별 감속 ----------
-        # IDLE_UNTIL_THREAT 모드에서는 위험할수록 오히려 더 움직여야(물러나야) 하므로
-        # 여기서 속도를 깎지 않는다. 위험도에 따른 긴급도는 이미 위 척력 계산에서
-        # PF_HUMAN_GAIN_BY_RISK로 반영됐다 (SAFE 1.0 / WARN 1.8 / DANGER 3.0).
-        if not config.IDLE_UNTIL_THREAT:
-            risk_scale = config.SPEED_SCALE_BY_RISK.get(risk_level, 0.0)
-            vx *= risk_scale
-            vy *= risk_scale
+        # ---------- 위험 등급별 배율 ----------
+        # DANGER를 0으로 두면 안 된다 - 위에서 인력을 끈 대신, 척력만으로 계산된
+        # "실제 물러나는 속도"가 여기 있으므로 그걸 죽이면 안 된다. SAFE=전속력,
+        # WARN=신중하게 감속(0.4배), DANGER=계산된 회피속도 그대로(1.0배).
+        risk_scale = config.SPEED_SCALE_BY_RISK.get(risk_level, 0.0)
+        vx *= risk_scale
+        vy *= risk_scale
 
         # ---------- 가속도 제한 ----------
         vx, vy = self._limit_accel(vx, vy, now)
