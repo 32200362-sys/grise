@@ -77,7 +77,8 @@ class RiskEvaluator:
         # 의도 신호 유지 (깜빡임 방지)
         self._intent_grip_until = 0.0
         self._intent_gaze_until = 0.0
-        self._grip_since: float | None = None   # grip 모양이 연속으로 시작된 시각
+        self._grip_since: float | None = None   # grip 모양이 (짧은 끊김 허용하며) 이어진 시작 시각
+        self._grip_last_shape = -1e9            # grip 모양이 마지막으로 보인 시각
 
     def reset(self) -> None:
         """컵이나 사람을 놓쳤을 때 미분 상태를 버린다 (재등장 시 속도 폭주 방지)."""
@@ -107,13 +108,16 @@ class RiskEvaluator:
         grip : 컵 근처의 잡기 모양이 GRIP_CONFIRM_S 이상 연속돼야 인정, 인정 후 GRIP_HOLD_S 유지.
         gaze : 감지되면 INTENT_HOLD_S 동안 유지 (고개를 잠깐 돌리는 것만으로 사라지지 않게).
         """
-        if config.INTENT_USE_GRIP and self.grip_shape_near_cup(hands, cup):
-            if self._grip_since is None:
-                self._grip_since = now
-            if now - self._grip_since >= config.GRIP_CONFIRM_S:
-                self._intent_grip_until = now + config.GRIP_HOLD_S
-        else:
-            self._grip_since = None
+        if config.INTENT_USE_GRIP:
+            if self.grip_shape_near_cup(hands, cup):
+                if self._grip_since is None:
+                    self._grip_since = now
+                self._grip_last_shape = now
+                if now - self._grip_since >= config.GRIP_CONFIRM_S:
+                    self._intent_grip_until = now + config.GRIP_HOLD_S
+            elif now - self._grip_last_shape > config.GRIP_GAP_S:
+                # 모양이 GRIP_GAP_S보다 오래 깨져야 확인 타이머를 처음부터 다시 시작한다
+                self._grip_since = None
         if config.INTENT_USE_GAZE and gaze is not None and gaze.looking_at_target:
             self._intent_gaze_until = now + config.INTENT_HOLD_S
 
@@ -231,6 +235,11 @@ class RiskEvaluator:
             intent_grip=grip_on,
             intent_gaze=gaze_on,
         )
+        if grip_exempt:
+            # 정상 픽업으로 인정되면 이전 위험 등급의 유지시간을 끊고 바로 SAFE로 내린다.
+            # (고속 접근은 grip_exempt가 아니므로 hold가 그대로 적용된다)
+            self._held_level, self._held_until = "SAFE", 0.0
+            return state
         return self._apply_hold(state, now)
 
     def _apply_hold(self, state: RiskState, now: float) -> RiskState:

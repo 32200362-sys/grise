@@ -353,6 +353,54 @@ check("컵에서 먼 다른 손이 C자 -> grip 아님", not s.intent_grip and s
 s = run_grip(lambda d: HandsResult(True, [hand(d, **C_SHAPE)]), 20, start=60.0)
 check("컵에서 35cm 밖의 C자 손 -> grip 아님", not s.intent_grip, f"grip={s.intent_grip}")
 
+# 손 떨림: 프레임 중 일부(0.05s)만 모양이 깨져도 grip이 유지/확정되어야 한다
+e = RiskEvaluator()
+t, got = 8000.0, []
+for i in range(20):
+    t += 0.05
+    shape = hand(20.0, 2.0, 2.8) if i % 5 == 4 else hand(20.0, **C_SHAPE)   # 5프레임에 1번 깨짐
+    s = e.evaluate(FakeHuman(joints=[FakeJoint(20.0, 0.0)]), cup0, t,
+                   hands=HandsResult(True, [shape]))
+    got.append(s.intent_grip)
+check("가끔 모양이 깨져도(0.05s) grip 유지", got[-1] and sum(got) >= 12, f"grip frames={sum(got)}/20")
+
+# 모양이 GRIP_HOLD_S보다 오래 깨지면 grip이 풀리고, 재진입 시 다시 확인을 거쳐야 한다
+e = RiskEvaluator()
+t = 8500.0
+for _ in range(8):
+    t += 0.05
+    e.evaluate(FakeHuman(joints=[FakeJoint(20.0, 0.0)]), cup0, t,
+               hands=HandsResult(True, [hand(20.0, **C_SHAPE)]))
+for _ in range(14):    # 0.7s 동안 편 손 (GRIP_HOLD_S 0.5s보다 길게)
+    t += 0.05
+    e.evaluate(FakeHuman(joints=[FakeJoint(20.0, 0.0)]), cup0, t,
+               hands=HandsResult(True, [hand(20.0, *OPEN_SHAPE)]))
+t += 0.05
+s = e.evaluate(FakeHuman(joints=[FakeJoint(20.0, 0.0)]), cup0, t,
+               hands=HandsResult(True, [hand(20.0, **C_SHAPE)]))
+check("모양이 오래 깨진 뒤 재진입 -> 즉시 grip 아님 (재확인 필요)", not s.intent_grip,
+      f"grip={s.intent_grip}")
+
+# grip 인정 즉시 이전 DANGER/WARN hold가 끊긴다
+e = RiskEvaluator()
+t = 9000.0
+for _ in range(6):     # 편 손으로 가까이 -> DANGER (hold 1.5s)
+    t += 0.05
+    s = e.evaluate(FakeHuman(joints=[FakeJoint(10.0, 0.0)]), cup0, t,
+                   hands=HandsResult(True, [hand(10.0, *OPEN_SHAPE)]))
+check("편 손으로 근접 -> DANGER", s.level == "DANGER", f"got {s.level}")
+for _ in range(8):     # C자로 바꿈 (0.4s) -> grip 인정
+    t += 0.05
+    s = e.evaluate(FakeHuman(joints=[FakeJoint(10.0, 0.0)]), cup0, t,
+                   hands=HandsResult(True, [hand(10.0, **C_SHAPE)]))
+check("grip 인정되면 DANGER hold 남아도 즉시 SAFE", s.level == "SAFE" and s.intent_grip,
+      f"got {s.level} ({s.reason})")
+for _ in range(14):    # 0.7s 동안 편 손 (GRIP_HOLD_S 0.5s보다 길게) -> grip 풀림
+    t += 0.05
+    s = e.evaluate(FakeHuman(joints=[FakeJoint(10.0, 0.0)]), cup0, t,
+                   hands=HandsResult(True, [hand(10.0, *OPEN_SHAPE)]))
+check("grip이 풀리면 다시 DANGER", s.level == "DANGER", f"got {s.level} ({s.reason})")
+
 # C자 모양으로 0.5s 가까이 머문 뒤(grip 확정) 100cm/s로 휘두름
 e = RiskEvaluator()
 t, levels = 7000.0, []

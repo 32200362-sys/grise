@@ -96,7 +96,8 @@ GRIP_OPENNESS_MAX = 1.67     # 이보다 크면 편 손
 
 # grip 인정 조건 (모두 만족해야 SAFE 예외)
 GRIP_NEAR_CUP_CM = 35.0      # 컵에 가장 가까운 손이고, 그 손목이 컵에서 이 거리 안
-GRIP_CONFIRM_S = 0.3         # 위 모양이 이 시간 이상 연속 유지 (한 프레임 깜빡임 무시)
+GRIP_CONFIRM_S = 0.2         # 위 모양이 이 시간 이상 유지돼야 인정
+GRIP_GAP_S = 0.15            # 모양이 이보다 짧게 깨지는 것은 끊김으로 보지 않는다 (손 떨림 허용)
 GRIP_HOLD_S = 0.5            # 인정된 뒤 모양이 잠깐 깨져도 유지하는 시간
 GRIP_ALLOW_FAST_APPROACH = False  # False면 grip이어도 고속 접근(TTC DANGER)은 DANGER
 
