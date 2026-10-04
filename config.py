@@ -89,10 +89,10 @@ HAND_MIN_TRACKING_CONF = 0.5
 # 사람마다 다르므로 설정 패널에서 실제 값을 보며 맞출 것.
 # 2026-10-03: 0.55-1.70 / <=2.60 은 실측에서 손 모양의 58-81%를 grip으로 봤다.
 #   컵을 감싸는 C자 모양만 남기도록 좁혔다. 콘솔 로그의 hand=ap/op 값으로 다시 맞출 것.
-GRIP_APERTURE_MIN = 0.80     # 이보다 좁으면 집기(pinch)/주먹
-GRIP_APERTURE_MAX = 1.50     # 이보다 넓으면 편 손
-GRIP_OPENNESS_MIN = 1.70     # 이보다 작으면 주먹
-GRIP_OPENNESS_MAX = 2.30     # 이보다 크면 편 손
+GRIP_APERTURE_MIN = 0.29     # 이보다 좁으면 집기(pinch)/주먹
+GRIP_APERTURE_MAX = 1.05     # 이보다 넓으면 편 손
+GRIP_OPENNESS_MIN = 1.31     # 이보다 작으면 주먹
+GRIP_OPENNESS_MAX = 1.67     # 이보다 크면 편 손
 
 # grip 인정 조건 (모두 만족해야 SAFE 예외)
 GRIP_NEAR_CUP_CM = 35.0      # 컵에 가장 가까운 손이고, 그 손목이 컵에서 이 거리 안
