@@ -287,6 +287,26 @@ for _ in range(40):
 check("고속 접근 -> 접근속도 양수로 검출", s.approach_speed_cm_s > 0, f"v={s.approach_speed_cm_s:.1f}")
 check("고속 접근 -> DANGER 도달", "DANGER" in levels, f"levels={set(levels)}")
 
+# TTC 적용거리: 컵에서 먼 곳(150->110cm)의 빠른 움직임은 무시, 안쪽(80cm 이내)은 반응
+ev_far = RiskEvaluator()
+tt = 3500.0
+d = 150.0
+lv_far = []
+for _ in range(8):
+    tt += 0.05
+    d -= 5.0                       # 100 cm/s로 접근하지만 아직 110cm 밖
+    lv_far.append(ev_far.evaluate(FakeHuman(joints=[FakeJoint(d, 0.0)]), cup0, tt).level)
+check("TTC 적용거리 밖의 고속 움직임 -> SAFE", set(lv_far) == {"SAFE"}, f"levels={set(lv_far)} d={d}")
+ev_near = RiskEvaluator()
+tt = 3600.0
+d = 112.0
+lv_near = []
+for _ in range(12):
+    tt += 0.05
+    d -= 5.0                       # 112 -> 52cm, 안쪽으로 들어오면서 반응해야 함
+    lv_near.append(ev_near.evaluate(FakeHuman(joints=[FakeJoint(d, 0.0)]), cup0, tt).level)
+check("TTC 적용거리 안으로 들어오면 고속 접근 -> DANGER", "DANGER" in lv_near, f"levels={set(lv_near)}")
+
 # hold: DANGER 직후 손을 치워도 바로 SAFE로 안 떨어져야 함
 ev4 = RiskEvaluator()
 tt = 4000.0

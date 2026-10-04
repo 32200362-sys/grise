@@ -185,7 +185,9 @@ class RiskEvaluator:
 
         # --- 그립(집기 자세) 감지 시: 정상적인 픽업으로 보고 회피하지 않는다 ---
         # 단, 잡기 모양이어도 TTC DANGER 수준으로 빠르게 오면 치는 동작으로 본다.
-        fast = (speed > config.RISK_APPROACH_SPEED_CM_S
+        # 속도/TTC 규칙은 컵에서 RISK_TTC_MAX_DIST_CM 안에서만 적용한다.
+        ttc_zone = dist <= config.RISK_TTC_MAX_DIST_CM
+        fast = (ttc_zone and speed > config.RISK_APPROACH_SPEED_CM_S
                 and ttc is not None and ttc < config.RISK_TTC_DANGER_S)
         grip_exempt = grip_on and (config.GRIP_ALLOW_FAST_APPROACH or not fast)
         tag = "grasp, too fast" if grip_on else "no grasp"
@@ -208,7 +210,8 @@ class RiskEvaluator:
             if dist < danger_dist:
                 level, reason = "DANGER", f"close {dist:.0f}cm ({tag})"
             elif (
-                speed > config.RISK_APPROACH_SPEED_CM_S
+                ttc_zone
+                and speed > config.RISK_APPROACH_SPEED_CM_S
                 and ttc is not None
                 and ttc < ttc_danger
             ):
@@ -216,7 +219,8 @@ class RiskEvaluator:
             elif dist < warn_dist:
                 level, reason = "WARN", f"approaching {dist:.0f}cm ({tag})"
             elif (
-                speed > config.RISK_APPROACH_SPEED_CM_S
+                ttc_zone
+                and speed > config.RISK_APPROACH_SPEED_CM_S
                 and ttc is not None
                 and ttc < ttc_warn
             ):

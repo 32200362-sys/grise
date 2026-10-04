@@ -67,6 +67,7 @@ PARAM_SPECS: dict[str, list[tuple]] = {
         ("RISK_WARN_DIST_CM", "WARN 거리", 5, 120, 1, "이 안이면 경고 (감속)"),
         ("RISK_APPROACH_SPEED_CM_S", "접근속도 임계", 3, 100, 1, "이보다 빠르게 다가오면 TTC 판정"),
         ("RISK_TTC_DANGER_S", "TTC DANGER", 0.1, 3.0, 2, "충돌예상시간이 이보다 짧으면 위험"),
+        ("RISK_TTC_MAX_DIST_CM", "TTC 적용거리", 20, 300, 0, "손이 컵에서 이 거리 안일 때만 속도/TTC 판정"),
         ("RISK_TTC_WARN_S", "TTC WARN", 0.2, 5.0, 2, "충돌예상시간이 이보다 짧으면 경고"),
         ("RISK_DIST_EMA_ALPHA", "거리 스무딩", 0.05, 1.0, 2, "작을수록 부드럽고 느림"),
         ("RISK_SPEED_EMA_ALPHA", "속도 스무딩", 0.05, 1.0, 2, "작을수록 부드럽고 느림"),

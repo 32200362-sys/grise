@@ -184,6 +184,11 @@ RISK_WARN_DIST_CM = 35.0     # 이 안쪽이면 WARN
 # 접근 속도 기준 (cm/s, 양수 = 가까워지는 중)
 RISK_APPROACH_SPEED_CM_S = 25.0
 
+# 속도/TTC 규칙은 손이 컵에서 이 거리 안일 때만 적용한다.
+# 그 밖에서 빠르게 움직이는 손(컵과 무관한 팔 동작, 위치 튐)에는 반응하지 않는다.
+# 거리 규칙(DANGER/WARN 거리)에는 영향이 없다.
+RISK_TTC_MAX_DIST_CM = 80.0
+
 # 충돌 예상 시간(TTC) 기준 (s). 접근 속도가 임계 이상이고 TTC가 이보다 짧으면 DANGER.
 RISK_TTC_DANGER_S = 0.8
 RISK_TTC_WARN_S = 1.6
