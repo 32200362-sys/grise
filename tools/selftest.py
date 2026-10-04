@@ -308,7 +308,11 @@ check("사람/컵 미검출 -> SAFE", s.level == "SAFE" and s.distance_cm is Non
 # ---- 엄격한 그립 판정 ----
 from perception.hand_tracker import HandInfo, HandsResult  # noqa: E402
 
-C_SHAPE = dict(aperture=1.1, openness=2.0)   # 컵을 감싸는 C자
+# 모양은 config의 현재 그립 범위에서 계산한다 (캘리브레이션으로 값이 바뀌어도 테스트가 유지되게).
+AP_MID = (config.GRIP_APERTURE_MIN + config.GRIP_APERTURE_MAX) / 2
+OP_MID = (config.GRIP_OPENNESS_MIN + config.GRIP_OPENNESS_MAX) / 2
+C_SHAPE = dict(aperture=AP_MID, openness=OP_MID)   # 컵을 감싸는 C자
+OPEN_SHAPE = (config.GRIP_APERTURE_MAX + 0.8, config.GRIP_OPENNESS_MAX + 0.8)
 
 
 def hand(x, aperture, openness):
@@ -317,9 +321,9 @@ def hand(x, aperture, openness):
 
 
 check("C자 손 -> 잡기 모양", hand(0, **C_SHAPE).grasp_ready)
-check("편 손 -> 잡기 모양 아님", not hand(0, 2.0, 2.8).grasp_ready)
-check("주먹 -> 잡기 모양 아님", not hand(0, 0.9, 1.3).grasp_ready)
-check("집기(pinch) -> 잡기 모양 아님", not hand(0, 0.2, 2.0).grasp_ready)
+check("편 손 -> 잡기 모양 아님", not hand(0, *OPEN_SHAPE).grasp_ready)
+check("주먹 -> 잡기 모양 아님", not hand(0, AP_MID, config.GRIP_OPENNESS_MIN - 0.4).grasp_ready)
+check("집기(pinch) -> 잡기 모양 아님", not hand(0, config.GRIP_APERTURE_MIN * 0.5, OP_MID).grasp_ready)
 
 
 def run_grip(hands_fn, n, step_cm=0.0, start=10.0, t0=6000.0):
@@ -342,7 +346,7 @@ s = run_grip(lambda d: HandsResult(True, [hand(d, **C_SHAPE)]), 3)
 check("C자 손 0.15s만 -> 아직 grip 아님 (확정시간)", not s.intent_grip and s.level == "DANGER",
       f"got {s.level} grip={s.intent_grip}")
 
-s = run_grip(lambda d: HandsResult(True, [hand(d, 2.0, 2.8), hand(80.0, **C_SHAPE)]), 20)
+s = run_grip(lambda d: HandsResult(True, [hand(d, *OPEN_SHAPE), hand(80.0, **C_SHAPE)]), 20)
 check("컵에서 먼 다른 손이 C자 -> grip 아님", not s.intent_grip and s.level == "DANGER",
       f"got {s.level} grip={s.intent_grip}")
 
