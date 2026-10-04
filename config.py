@@ -104,7 +104,7 @@ GRIP_ALLOW_FAST_APPROACH = False  # False면 grip이어도 고속 접근(TTC DAN
 # 3-c) 인식 계층 - 시선(머리 방향) (FaceLandmarker)
 # =========================================================
 # 홍채가 아니라 머리 방향을 쓴다. 1~2m에서 홍채는 노이즈가 너무 크다.
-USE_GAZE = True
+USE_GAZE = False         # 시선 사용 안 함 (손 모양+동작만 판단). 모델도 로드하지 않는다
 FACE_MODEL_PATH = "models/face_landmarker.task"
 FACE_MIN_DETECTION_CONF = 0.5
 FACE_MIN_PRESENCE_CONF = 0.5
@@ -222,7 +222,7 @@ INCIDENT_LOG_COOLDOWN_S = 5.0   # 연속 저장 최소 간격
 # 2026-10-03: 느슨한 판정에서 grip이 거의 항상 감지돼 위험의 ~90%가 SAFE로 묻혔다.
 #   GRIP_* 조건을 엄격하게 바꾼 뒤 다시 켰다 (3-b 참고).
 INTENT_USE_GRIP = True       # 그립 모양으로 정상 픽업을 판별할지
-INTENT_USE_GAZE = True       # 시선(머리 방향)을 임계값 확장 보조 신호로 쓸지
+INTENT_USE_GAZE = False      # 시선 보정 끔. 켜면 USE_GAZE도 True여야 한다
 
 # 의도가 감지되면 거리/TTC 임계값에 곱할 배수 (1.0 = 효과 없음)
 INTENT_DIST_BOOST = 1.5      # 예: WARN 35cm -> 52.5cm 에서 반응
