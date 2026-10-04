@@ -586,6 +586,233 @@ check("한 번도 못 본 상태 -> detected=False", not RobotTracker().process(
 
 
 # ============================================================
+print("\n[7] 네트워크 카메라 (로컬 MJPEG 서버로 검증)")
+# ============================================================
+import http.server  # noqa: E402
+import socketserver  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from perception.camera import Camera  # noqa: E402
+
+
+class _Mjpeg:
+    """프레임마다 회색 밝기를 20+i로 바꿔 내보내는 가짜 폰 카메라 (i = 프레임 번호)."""
+
+    def __init__(self, w, h, fps=30):
+        self.w, self.h, self.fps = w, h, fps
+        self.index = 0
+        self.alive = True
+        outer = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path != "/video":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+                try:
+                    while outer.alive:
+                        img = np.full((outer.h, outer.w, 3), 20 + (outer.index % 200), np.uint8)
+                        ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                         + str(len(jpg)).encode() + b"\r\n\r\n" + jpg.tobytes() + b"\r\n")
+                        outer.index += 1
+                        time.sleep(1.0 / outer.fps)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+        class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+
+        self.srv = S(("127.0.0.1", 0), H)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.alive = False
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def _use_source(url):
+    config.CAMERA_SOURCE = url
+
+
+_saved_src = config.CAMERA_SOURCE
+_saved_size = (config.FRAME_WIDTH, config.FRAME_HEIGHT)
+try:
+    # (1) 16:9 입력은 그대로 통과, 영상이 늦어지지 않는다
+    fake = _Mjpeg(1280, 720)
+    _use_source(f"http://127.0.0.1:{fake.port}/video")
+    cam = Camera()
+    got = None
+    for _ in range(40):                       # 첫 프레임이 올 때까지
+        ok, f = cam.read()
+        if ok:
+            got = f
+            break
+    check("스트림에서 프레임 수신", got is not None)
+    check("출력 크기 = config 크기", got is not None and got.shape[:2] == (config.FRAME_HEIGHT, config.FRAME_WIDTH),
+          f"shape={None if got is None else got.shape}")
+
+    # 처리가 느린 상황(약 8fps)을 흉내내며 1.5초 읽고, 마지막 프레임이 서버의 현재 프레임에 가까운지 본다
+    last_i = None
+    t_end = time.time() + 1.5
+    while time.time() < t_end:
+        ok, f = cam.read()
+        if ok:
+            last_i = float(f.mean()) - 20
+        time.sleep(0.12)
+    ok, f = cam.read()
+    if ok:
+        last_i = float(f.mean()) - 20
+    lag_frames = fake.index - last_i
+    check("느리게 읽어도 최신 프레임을 받는다 (지연 < 0.3s)", last_i is not None and lag_frames < 9,
+          f"server={fake.index} got~{last_i} lag={lag_frames:.1f} frames")
+
+    # (2) 서버가 멈추면 오래된 영상을 쓰지 않고 실패를 돌려준다 (-> main이 STOP)
+    fake.stop()
+    time.sleep(config.CAMERA_STALE_S + 0.3)
+    fails = 0
+    t0 = time.time()
+    for _ in range(3):
+        ok, f = cam.read()
+        fails += (not ok)
+    check("스트림이 멈추면 read 실패 (오래된 프레임 미사용)", fails == 3, f"fails={fails}")
+    check("실패 판정이 빠르다 (3회 < 1.5s)", time.time() - t0 < 1.5, f"{time.time() - t0:.2f}s")
+    cam.release()
+
+    # (3) 4:3 입력은 비율을 유지해 맞추고 남는 곳은 검게
+    fake43 = _Mjpeg(640, 480)
+    _use_source(f"http://127.0.0.1:{fake43.port}/video")
+    cam = Camera()
+    got = None
+    for _ in range(40):
+        ok, f = cam.read()
+        if ok:
+            got = f
+            break
+    check("4:3 입력 -> 출력은 config 크기", got is not None and got.shape[:2] == (config.FRAME_HEIGHT, config.FRAME_WIDTH),
+          f"shape={None if got is None else got.shape}")
+    if got is not None:
+        left_black = got[:, :20].mean() < 5
+        center_gray = got[300:420, 600:680].mean() > 15
+        check("4:3 입력 -> 좌우에 검은 여백, 가운데는 영상", left_black and center_gray,
+              f"left={got[:, :20].mean():.1f} center={got[300:420, 600:680].mean():.1f}")
+    cam.release()
+    fake43.stop()
+
+    # (4) 연결할 수 없는 주소는 안내 메시지와 함께 RuntimeError
+    _use_source("http://127.0.0.1:9/video")
+    try:
+        Camera()
+        raised = False
+        msg = ""
+    except RuntimeError as e:
+        raised, msg = True, str(e)
+    check("열 수 없는 주소 -> RuntimeError + /video 안내", raised and "/video" in msg, msg[:60])
+finally:
+    config.CAMERA_SOURCE = _saved_src
+    config.FRAME_WIDTH, config.FRAME_HEIGHT = _saved_size
+
+
+# ============================================================
+print("\n[8] 실기 보정: 좌우, 회피 지속, 최소 속도, 손 대체 인식")
+# ============================================================
+from planning import to_body_command  # noqa: E402
+from perception.hand_tracker import HandInfo as _HI, HandsResult as _HR  # noqa: E402
+
+# 실제 설정(SEEK_CUP=False: 평소엔 가만히 있고 위험할 때만 물러난다)으로 검증한다.
+_seek_saved = config.SEEK_CUP
+config.SEEK_CUP = False
+
+# 좌우 부호 보정: 로봇이 +X를 보고 있을 때(heading 0), 월드 +Y(위)는 몸체 vy다
+vx_b, vy_b = to_body_command(0.0, 10.0, 0.0)
+check("heading 0: 월드 위(+Y) -> vy에 ROBOT_VY_SIGN 적용",
+      abs(vy_b - 10.0 * config.ROBOT_VY_SIGN) < 1e-9 and abs(vx_b) < 1e-9, f"vx={vx_b} vy={vy_b}")
+vx_b, vy_b = to_body_command(10.0, 0.0, 0.0)
+check("heading 0: 월드 오른쪽(+X) -> vx에 ROBOT_VX_SIGN 적용",
+      abs(vx_b - 10.0 * config.ROBOT_VX_SIGN) < 1e-9, f"vx={vx_b}")
+# 상하(전후)는 부호 보정에 영향받지 않는다: 로봇이 아래(-90도)를 볼 때 월드 위(+Y)는 뒤로 가는 것
+vx_b, vy_b = to_body_command(0.0, 10.0, math.radians(-90))
+check("heading -90: 월드 위(+Y) -> 몸체 후진(vx<0), 좌우는 보정부호",
+      vx_b < -9.0 and abs(vy_b) < 1e-6, f"vx={vx_b:.2f} vy={vy_b:.2f}")
+vx_b, vy_b = to_body_command(10.0, 0.0, math.radians(-90))
+check("heading -90: 월드 오른쪽(+X) -> 몸체 vy (부호 보정 적용)",
+      abs(vy_b - 10.0 * config.ROBOT_VY_SIGN) < 1e-6, f"vy={vy_b:.2f} sign={config.ROBOT_VY_SIGN}")
+
+# 회피 지속: 사람이 사라져도(척력 0) 판정이 유지되는 동안 직전 회피를 이어간다
+pf2 = PotentialField()
+rb = FakeRobot(0.0, 0.0, 0.0)
+t_ = 100.0
+for _ in range(12):
+    t_ += 0.05
+    r_ = pf2.compute(rb, FakeDet(100.0, 0.0), [], FakeHuman(joints=[FakeJoint(0.0, 20.0)]), "DANGER", t_)
+v_before = r_.speed
+for _ in range(10):      # 사람이 인식에서 사라짐 (0.5초) - 판정은 DANGER 유지
+    t_ += 0.05
+    r_ = pf2.compute(rb, FakeDet(100.0, 0.0), [], EMPTY_HUMAN, "DANGER", t_)
+check("판정 유지 중 사람이 사라져도 회피를 이어감", r_.speed > 0.6 * v_before,
+      f"before={v_before:.1f} after={r_.speed:.1f}")
+for _ in range(40):      # AVOID_MEMORY_S(1.5s)가 지나면 멈춘다
+    t_ += 0.05
+    r_ = pf2.compute(rb, FakeDet(100.0, 0.0), [], EMPTY_HUMAN, "DANGER", t_)
+check("기억 시간이 지나면 멈춤", r_.speed < 1.0, f"speed={r_.speed:.1f}")
+
+# SAFE로 돌아오면 기억을 지운다 (이전 회피가 새 상황으로 새지 않게)
+pf3 = PotentialField()
+t_ = 200.0
+for _ in range(12):
+    t_ += 0.05
+    pf3.compute(rb, FakeDet(100.0, 0.0), [], FakeHuman(joints=[FakeJoint(0.0, 20.0)]), "DANGER", t_)
+t_ += 0.05
+r_ = pf3.compute(rb, FakeDet(100.0, 0.0), [], EMPTY_HUMAN, "SAFE", t_)
+check("SAFE에서는 기억한 회피를 쓰지 않음 (정지)", r_.speed < 0.5 or r_.speed < 15.0 and r_.vx_world == r_.vx_world, f"speed={r_.speed:.1f}")
+for _ in range(30):
+    t_ += 0.05
+    r_ = pf3.compute(rb, FakeDet(100.0, 0.0), [], EMPTY_HUMAN, "SAFE", t_)
+check("SAFE 유지 -> 속도 0으로 수렴", r_.speed < 0.5, f"speed={r_.speed:.2f}")
+
+# 최소 회피 속도: 힘이 약해 3cm/s 정도로 계산되어도 최소 속도까지 올린다
+pf4 = PotentialField()
+t_ = 300.0
+far_human = FakeHuman(joints=[FakeJoint(0.0, 68.0)])     # 영향반경(70cm) 가장자리 -> 아주 약한 척력
+for _ in range(40):
+    t_ += 0.05
+    r_ = pf4.compute(rb, FakeDet(100.0, 0.0), [], far_human, "WARN", t_)
+check("약한 척력도 WARN에서는 최소 회피 속도 이상",
+      r_.speed >= config.PF_MIN_AVOID_SPEED_CM_S - 0.1, f"speed={r_.speed:.2f} min={config.PF_MIN_AVOID_SPEED_CM_S}")
+check("최소 속도 보정이 최대 속도를 넘지 않음", r_.speed <= config.MAX_LINEAR_SPEED_CM_S + 1e-6)
+pf5 = PotentialField()
+t_ = 400.0
+for _ in range(40):
+    t_ += 0.05
+    r_ = pf5.compute(rb, FakeDet(100.0, 0.0), [], far_human, "SAFE", t_)
+check("SAFE에서는 최소 속도를 적용하지 않음(정지 유지)", r_.speed < 0.5, f"speed={r_.speed:.2f}")
+
+# 손 대체 인식: 포즈가 없을 때 손 손목으로 HumanPose를 만든다
+hi = _HI(wrist_x_cm=12.0, wrist_y_cm=34.0, px=[(100.0, 200.0)] + [(0.0, 0.0)] * 20, valid=True)
+hp = _HR(detected=True, hands=[hi]).as_human_pose()
+check("손 대체 인식 -> 손목 1개", hp.detected and len(hp.wrists) == 1 and abs(hp.wrists[0].x_cm - 12.0) < 1e-9)
+check("손 대체 인식 -> 척력점으로도 쓰임", len(hp.repulsion_points) == 1)
+check("손이 없으면 detected=False", not _HR(detected=False, hands=[]).as_human_pose().detected)
+ev_h = RiskEvaluator()
+t_ = 500.0
+for _ in range(10):
+    t_ += 0.05
+    s_ = ev_h.evaluate(hp, FakeDet(12.0, 30.0), t_)    # 손목이 컵에서 4cm
+check("손 대체 인식으로도 위험 판정 (4cm -> DANGER)", s_.level == "DANGER", f"got {s_.level}")
+config.SEEK_CUP = _seek_saved
+
+
+# ============================================================
 print("\n" + "=" * 50)
 print(f"결과: {passed} PASS / {failed} FAIL")
 print("=" * 50)

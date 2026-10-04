@@ -11,6 +11,9 @@ RobotTracker가 update_scale()을 호출해 주고, 마커가 안 보이면 직�
 
 from __future__ import annotations
 
+import os
+import threading
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -59,32 +62,139 @@ class WorldFrame:
 
 
 class Camera:
-    """OpenCV VideoCapture 래퍼."""
+    """
+    영상 입력. USB 웹캠(CAMERA_INDEX) 또는 네트워크 스트림(CAMERA_SOURCE, 예: 폰 IP Webcam 앱).
+
+    네트워크 스트림은 별도 스레드가 계속 받아 '가장 최근 프레임'만 남긴다.
+    처리 속도(약 15fps)가 송출 속도(30fps)보다 느릴 때 오래된 프레임이 쌓여 영상이
+    점점 늦어지는 것을 막기 위해서다. 새 프레임이 오래 안 오면 read()가 실패를 돌려주고
+    main이 STOP을 보낸다. 스트림이 끊기면 자동으로 다시 연결한다.
+
+    출력 프레임은 항상 config.FRAME_WIDTH x FRAME_HEIGHT다. 입력 해상도가 다르면
+    비율을 유지한 채 맞추고 남는 곳은 검게 채운다 (좌표 계산이 이 크기를 전제로 한다).
+    """
 
     def __init__(self) -> None:
-        self.cap = cv2.VideoCapture(config.CAMERA_INDEX)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
-        self.cap.set(cv2.CAP_PROP_FPS, config.TARGET_FPS)
-        # 버퍼가 쌓이면 지연이 생겨 실시간 제어에 치명적이다.
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        src = config.CAMERA_SOURCE
+        self.source = config.CAMERA_INDEX if src is None else src
+        self.is_stream = isinstance(self.source, str)
+        self.world = WorldFrame()
+        self._size_warned = False
 
+        self.cap = self._open()
         if not self.cap.isOpened():
+            if self.is_stream:
+                raise RuntimeError(
+                    f"카메라 스트림을 열 수 없습니다 ({self.source}).\n"
+                    "  - 폰 앱에서 서버가 켜져 있는지, PC와 같은 Wi-Fi인지 확인하세요.\n"
+                    "  - IP Webcam 앱은 주소 끝에 /video 가 붙어야 합니다 (예: http://폰IP:8080/video)."
+                )
             raise RuntimeError(
                 f"웹캠을 열 수 없습니다 (CAMERA_INDEX={config.CAMERA_INDEX}). "
                 "config.py의 CAMERA_INDEX를 확인하세요."
             )
 
-        self.world = WorldFrame()
+        self._stop = threading.Event()
+        self._cond = threading.Condition()
+        self._frame = None
+        self._frame_t = 0.0
+        self._seq = 0
+        self._last_seq = 0
+        self._thread = None
+        if self.is_stream:
+            self._thread = threading.Thread(target=self._reader, name="camera-reader", daemon=True)
+            self._thread.start()
+            print(f"[Camera] 스트림 연결: {self.source}")
 
+    # ------------------------------------------------------------------ 열기
+    def _open(self):
+        if self.is_stream:
+            # 버퍼링을 줄이고, 응답이 없으면 5초 뒤 포기한다 (ffmpeg 옵션, OpenCV가 열 때 읽는다).
+            os.environ.setdefault(
+                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                "fflags;nobuffer|flags;low_delay|timeout;5000000",
+            )
+            cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+        else:
+            cap = cv2.VideoCapture(self.source)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, config.TARGET_FPS)
+        # 버퍼가 쌓이면 지연이 생겨 실시간 제어에 치명적이다.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    # ------------------------------------------------------------------ 스트림 수신 스레드
+    def _reader(self) -> None:
+        fails = 0
+        while not self._stop.is_set():
+            ok, frame = self.cap.read()
+            if ok and frame is not None:
+                fails = 0
+                with self._cond:
+                    self._frame = frame
+                    self._frame_t = time.time()
+                    self._seq += 1
+                    self._cond.notify_all()
+                continue
+            fails += 1
+            time.sleep(0.05)
+            if fails >= config.CAMERA_RECONNECT_AFTER:
+                fails = 0
+                print("[Camera] 스트림이 끊겼습니다. 다시 연결합니다...")
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = self._open()
+
+    # ------------------------------------------------------------------ 크기 맞추기
+    def _fit(self, frame):
+        W, H = config.FRAME_WIDTH, config.FRAME_HEIGHT
+        h, w = frame.shape[:2]
+        if (w, h) == (W, H):
+            return frame
+        if not self._size_warned:
+            self._size_warned = True
+            print(f"[Camera] 입력 {w}x{h} -> {W}x{H}로 맞춥니다"
+                  + ("" if abs(w / h - W / H) < 0.01 else " (비율이 달라 검은 여백을 채웁니다)"))
+        s = min(W / w, H / h)
+        nw, nh = max(1, round(w * s)), max(1, round(h * s))
+        interp = cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR
+        resized = cv2.resize(frame, (nw, nh), interpolation=interp)
+        if (nw, nh) == (W, H):
+            return resized
+        canvas = np.zeros((H, W, 3), dtype=frame.dtype)
+        x0, y0 = (W - nw) // 2, (H - nh) // 2
+        canvas[y0:y0 + nh, x0:x0 + nw] = resized
+        return canvas
+
+    # ------------------------------------------------------------------ 읽기
     def read(self):
-        """(ok, frame) 반환. frame은 BGR."""
-        ok, frame = self.cap.read()
-        if not ok:
-            return False, None
+        """(ok, frame) 반환. frame은 BGR. 새 프레임이 없거나 너무 오래됐으면 (False, None)."""
+        if not self.is_stream:
+            ok, frame = self.cap.read()
+            if not ok:
+                return False, None
+        else:
+            deadline = time.time() + config.CAMERA_READ_TIMEOUT_S
+            with self._cond:
+                while self._seq == self._last_seq:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        return False, None
+                    self._cond.wait(remaining)
+                self._last_seq = self._seq
+                frame, frame_t = self._frame, self._frame_t
+            if time.time() - frame_t > config.CAMERA_STALE_S:
+                return False, None
+        frame = self._fit(frame)
         if config.FLIP_HORIZONTAL:
             frame = cv2.flip(frame, 1)
         return True, frame
 
     def release(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
         self.cap.release()

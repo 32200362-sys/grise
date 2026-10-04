@@ -50,7 +50,7 @@ from perception import (
     PoseTracker,
     RobotTracker,
 )
-from planning import PotentialField, heading_command, world_to_robot
+from planning import PotentialField, heading_command, to_body_command
 from safety import IncidentLogger
 from ui import SettingsPanel, load_tuning
 
@@ -303,6 +303,11 @@ def main() -> None:
                 target = (cup.x_cm, cup.y_cm) if cup else None
                 gaze = gaze_tracker.process(rgb, world, target, now)
 
+            # 포즈(몸) 인식이 안 되면 손 인식의 손목으로 대신한다 (손/팔만 보일 때, 가려질 때).
+            if (config.HAND_FALLBACK and hands is not None and hands.detected
+                    and (not human.detected or not human.wrists)):
+                human = hands.as_human_pose()
+
             # ---------------- [2] 판단 계층 ----------------
             # hands/gaze는 임계값을 넓히는 데만 쓰인다. 하드 정지는 거리·속도만 트리거한다.
             risk = risk_eval.evaluate(human, cup, now, hands=hands, gaze=gaze)
@@ -319,12 +324,12 @@ def main() -> None:
 
             # 월드 -> 로봇 좌표계 회전변환
             if robot.detected:
-                vx_r, vy_r = world_to_robot(
+                vx_r, vy_r = to_body_command(
                     field.vx_world, field.vy_world, robot.heading_rad
                 )
                 w_cmd = heading_command(
                     field.vx_world, field.vy_world, robot.heading_rad
-                ) if config.HEADING_CONTROL else 0.0
+                ) * config.ROBOT_W_SIGN if config.HEADING_CONTROL else 0.0
             else:
                 # 로봇 위치를 모르면 어떤 방향으로 보낼지 알 수 없다. 무조건 정지.
                 vx_r = vy_r = w_cmd = 0.0

@@ -38,6 +38,12 @@ def world_to_robot(vx_w: float, vy_w: float, heading_rad: float) -> tuple[float,
     return vx_r, vy_r
 
 
+def to_body_command(vx_w: float, vy_w: float, heading_rad: float) -> tuple[float, float]:
+    """월드 속도를 로봇 몸체 좌표로 바꾸고, 실기 보정 부호(ROBOT_VX_SIGN, ROBOT_VY_SIGN)를 적용한다."""
+    vx_r, vy_r = world_to_robot(vx_w, vy_w, heading_rad)
+    return vx_r * config.ROBOT_VX_SIGN, vy_r * config.ROBOT_VY_SIGN
+
+
 def heading_command(vx_w: float, vy_w: float, heading_rad: float) -> float:
     """
     진행 방향과 현재 heading의 오차로부터 각속도 명령 [rad/s]를 만든다.

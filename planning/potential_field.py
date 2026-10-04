@@ -76,11 +76,14 @@ class PotentialField:
         self._prev_vx = 0.0
         self._prev_vy = 0.0
         self._prev_t: float | None = None
+        # 직전에 실제 척력으로 계산된 회피 속도 (vx, vy, 시각)
+        self._last_avoid: tuple[float, float, float] | None = None
 
     def reset(self) -> None:
         self._prev_vx = 0.0
         self._prev_vy = 0.0
         self._prev_t = None
+        self._last_avoid = None
 
     def compute(
         self,
@@ -207,6 +210,24 @@ class PotentialField:
         risk_scale = config.SPEED_SCALE_BY_RISK.get(risk_level, 0.0)
         vx *= risk_scale
         vy *= risk_scale
+
+        # ---------- 회피 중 보정 ----------
+        if risk_level == "SAFE":
+            self._last_avoid = None
+        else:
+            sp = math.hypot(vx, vy)
+            if sp >= 2.0:
+                self._last_avoid = (vx, vy, now)
+            elif (self._last_avoid is not None
+                  and now - self._last_avoid[2] <= config.AVOID_MEMORY_S):
+                # 판정은 유지되는데 사람이 잠깐 인식에서 빠져 척력이 0이다 -> 직전 회피를 이어간다.
+                vx, vy = self._last_avoid[0], self._last_avoid[1]
+                sp = math.hypot(vx, vy)
+            # 너무 약한 속도는 바퀴가 정지마찰을 못 넘는다 -> 방향은 두고 최소 속도까지 올린다.
+            if 0.5 < sp < config.PF_MIN_AVOID_SPEED_CM_S:
+                k = config.PF_MIN_AVOID_SPEED_CM_S / sp
+                vx *= k
+                vy *= k
 
         # ---------- 가속도 제한 ----------
         vx, vy = self._limit_accel(vx, vy, now)

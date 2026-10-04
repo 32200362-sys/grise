@@ -72,7 +72,7 @@ def main() -> int:
 
     # ---------------- 카메라 ----------------
     print(f"\n[카메라] 인덱스 {args.camera} 여는 중...")
-    cap = cv2.VideoCapture(args.camera)
+    cap = cv2.VideoCapture(config.CAMERA_SOURCE if (config.CAMERA_SOURCE is not None and args.camera == config.CAMERA_INDEX) else args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

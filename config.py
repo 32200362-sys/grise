@@ -18,7 +18,15 @@ D.I.G - 전역 설정
 # =========================================================
 # 1) 카메라 / 좌표 변환
 # =========================================================
-CAMERA_INDEX = 0
+CAMERA_INDEX = 0             # USB 웹캠 번호 (CAMERA_SOURCE가 None일 때 사용)
+
+# 카메라 입력 주소. None이면 위 CAMERA_INDEX(USB 웹캠)를 쓴다.
+# 겔럭시 폰 + IP Webcam 앱: "http://<폰IP>:8080/video"  (앱에서 서버 시작 후 표시되는 주소 + /video)
+# PC와 폰이 같은 Wi-Fi여야 한다. 폰 IP는 Wi-Fi가 바뀌면 달라진다.
+CAMERA_SOURCE = "http://10.232.69.154:8080/video"
+CAMERA_READ_TIMEOUT_S = 0.25   # 새 프레임을 이만큼 기다려도 안 오면 이번 프레임은 실패 -> STOP
+CAMERA_STALE_S = 0.5           # 받은 프레임이 이보다 오래됐으면 버린다 (지연된 영상으로 판단하지 않음)
+CAMERA_RECONNECT_AFTER = 20    # 연속 실패가 이 횟수(약 1초 이상)면 스트림을 다시 연결
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 TARGET_FPS = 30
@@ -77,6 +85,9 @@ POSE_MIN_VISIBILITY = 0.4    # 이 값 미만인 랜드마크는 없는 것으�
 # Pose는 손목 1점만 준다. 손가락 21점은 이 모델이 따로 필요하다.
 #   python tools/download_models.py
 USE_HAND = True
+# 포즈(몸) 인식이 안 될 때(손/팔만 화면에 있거나 가려질 때) 손 인식 결과를 손목으로 대신 쓴다.
+# 로그에서 위험 판정 중 44%가 '사람 없음'으로 떨어져 로봇이 멈췄다.
+HAND_FALLBACK = True
 HAND_MODEL_PATH = "models/hand_landmarker.task"
 HAND_NUM_HANDS = 2
 HAND_MIN_DETECTION_CONF = 0.5
@@ -216,7 +227,7 @@ RISK_SPEED_EMA_ALPHA = 0.3
 
 # 채터링 방지: 한번 DANGER가 뜨면 최소 이 시간만큼 유지
 RISK_DANGER_HOLD_S = 1.5     # 0.7은 로봇이 가속(25cm/s^2)을 끝내기 전에 회피가 끝났다
-RISK_WARN_HOLD_S = 0.4
+RISK_WARN_HOLD_S = 1.0     # 로봇이 가속을 끝낼 시간(0.6s) 이상 유지해야 눈에 보이게 움직인다
 
 # ---------------------------------------------------------
 # 위기 상황(DANGER) 스크린샷
@@ -318,6 +329,14 @@ PF_FORCE_TO_SPEED = 0.21
 PF_LOCAL_MINIMA_FORCE = 2.0
 PF_ESCAPE_GAIN = 0.6
 
+# 회피 중(WARN/DANGER) 최소 속도. 힘이 약해 계산된 속도가 3cm/s 이하로 나오면
+# 로봇 바퀴가 정지마찰을 못 넘어 움직이지 않는다. 방향은 유지하고 이 값까지 올린다.
+PF_MIN_AVOID_SPEED_CM_S = 6.0
+
+# 회피 중 사람이 잠깐 인식에서 사라져도(척력 0) 직전 회피 속도를 이 시간 동안 이어간다.
+# 판정은 hold로 유지되는데 속도만 0이 되어 로봇이 서버리는 문제를 막는다.
+AVOID_MEMORY_S = 1.5
+
 # 출력 속도 제한
 # 로봇 펌웨어 한계(15cm/s, 1.0rad/s)에 맞춘다. 더 높여도 송신부에서 잘린다.
 MAX_LINEAR_SPEED_CM_S = 15.0
@@ -331,8 +350,8 @@ MAX_LINEAR_ACCEL_CM_S2 = 90.0
 #   척력만으로 "물러나는 속도"를 계산해두는데, 여기서 0을 곱하면 그 속도가
 #   죽어서 실제로 가까운 위험에도 제자리에 얼어붙는다. 1.0으로 그대로 통과시켜야
 #   척력 기반 회피 동작이 실제로 나간다.
-# WARN은 0.4 -> 0.7: 최대속도가 15cm/s(펌웨어 한계)로 낮아져서 0.4면 6cm/s로 거의 안 움직였다.
-SPEED_SCALE_BY_RISK = {"SAFE": 1.0, "WARN": 0.7, "DANGER": 1.0}
+# WARN도 전속력(15cm/s): 로봇은 가속에 0.6초가 걸려서(펌웨어 25cm/s^2) 0.7배로는 WARN 동안 거의 안 움직였다.
+SPEED_SCALE_BY_RISK = {"SAFE": 1.0, "WARN": 1.0, "DANGER": 1.0}
 
 # =========================================================
 # 7) 자세 제어 (heading)
@@ -340,6 +359,13 @@ SPEED_SCALE_BY_RISK = {"SAFE": 1.0, "WARN": 0.7, "DANGER": 1.0}
 # 옴니휠이라 회전 없이도 어느 방향이든 이동한다. 켜면 물러날 때(진행 방향이 뒤쪽)
 # w가 최대치로 붙어 바퀴 속도 한도(20cm/s)를 회전에 써버려 이동량이 줄어든다.
 HEADING_CONTROL = False
+
+# 로봇 몸체 좌표 보정. 2026-10-04 실기 확인: 상하는 맞고 좌우만 반대로 움직였다.
+# vy(좌측 이동) 부호만 뒤집는다. 다른 로봇/마커 부착 방향이면 값을 바꿀 것.
+# (회전 w를 다시 켜면 부호를 확인할 것: ROBOT_W_SIGN)
+ROBOT_VX_SIGN = 1.0
+ROBOT_VY_SIGN = -1.0
+ROBOT_W_SIGN = 1.0
 # 진행 방향을 정면으로 맞추는 P 게인
 HEADING_KP = 2.0
 HEADING_DEADBAND_RAD = 0.08  # 이 안이면 회전 명령 0
@@ -350,7 +376,7 @@ HEADING_DEADBAND_RAD = 0.08  # 이 안이면 회전 명령 0
 # 로봇 펌웨어는 핫스팟 "균형"(172.20.10.0/28, 게이트웨이 172.20.10.1)에서 DHCP로 IP를 받는다.
 # None이면 브로드캐스트 STOP을 보내고 ESP32의 텔레메트리 응답으로 IP를 자동으로 찾는다.
 # 자동 탐색이 안 되면(방화벽 등) 시리얼 모니터 STATUS의 IP를 여기에 적는다. 예: "172.20.10.3"
-ESP32_IP = "172.20.10.3"     # 2026-10-03 핫스팟에서 확인한 로봇 주소. 바뀌면 None으로 두고 자동 탐색
+ESP32_IP = "10.232.69.103"    # 2026-10-04 폰 핫스팟에서 MAC(b0-cb-d8-7e-76-20)으로 확인한 로봇 주소. Wi-Fi가 바뀌면 다시 확인할 것
 ESP32_BROADCAST_IPS = ["172.20.10.15", "255.255.255.255"]  # 172.20.10.15 = /28 서브넷 브로드캐스트
 ESP32_PORT = 8888            # 펌웨어 명령 수신 포트
 TELEMETRY_PORT = 8889        # 펌웨어 텔레메트리 송신 포트 (PC가 수신)

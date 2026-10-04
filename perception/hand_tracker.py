@@ -93,6 +93,20 @@ class HandsResult:
     def any_grasp_ready(self) -> bool:
         return any(h.grasp_ready for h in self.hands)
 
+    def as_human_pose(self):
+        """포즈 인식이 안 될 때 손 손목 위치로 대신 만든 HumanPose (손목만 채운다)."""
+        from .pose_tracker import HumanPose, Joint
+
+        joints = [Joint(x_cm=h.wrist_x_cm, y_cm=h.wrist_y_cm, px=tuple(h.px[WRIST]))
+                  for h in self.hands if len(h.px) > WRIST]
+        if not joints:
+            return HumanPose(detected=False)
+        return HumanPose(
+            detected=True,
+            left_wrist=joints[0],
+            right_wrist=joints[1] if len(joints) > 1 else None,
+        )
+
     def nearest_to(self, x_cm: float, y_cm: float) -> HandInfo | None:
         if not self.hands:
             return None
