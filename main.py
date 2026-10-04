@@ -13,6 +13,7 @@ D.I.G - PC측 메인 파이프라인 (인식 -> 판단 -> 경로계산 -> 전송
 키:
     q / ESC : 종료 (종료 시 STOP 명령을 여러 번 전송)
     스페이스 : 일시정지 토글 (로봇 정지, 인식은 계속)
+    r       : ESP32 래치 폴트 리셋 요청 (원인을 확인한 뒤에만)
 
 안전 원칙:
     - 어떤 예외가 나든 finally에서 STOP을 보낸다.
@@ -61,7 +62,10 @@ from ui import SettingsPanel, load_tuning
 #   DANGER는 "정지"가 아니라 "회피(물러남 또는 제자리 대기)"를 뜻하므로(potential_field.py
 #   참고 - DANGER일 때 인력을 끄고 척력만으로 속도를 계산한다), "STOP"을 보내면
 #   그 회피 속도가 ESP32에서 0으로 덮어써져 실제로 가까운 위험에도 못 물러난다.
-STATUS_BY_RISK = {"SAFE": "RUN", "WARN": "SLOW", "DANGER": "RUN"}
+#   WARN도 "RUN"으로 보낸다. 로봇 펌웨어는 SLOW를 5cm/s로 다시 제한해서
+#   SPEED_SCALE_BY_RISK["WARN"]과 이중 감속이 된다 (회피가 거의 안 보임).
+#   WARN의 감속은 config.SPEED_SCALE_BY_RISK 한 곳에서만 한다.
+STATUS_BY_RISK = {"SAFE": "RUN", "WARN": "RUN", "DANGER": "RUN"}
 
 RISK_COLOR = {
     "SAFE": (0, 220, 0),
@@ -89,7 +93,7 @@ def draw_settings_button(frame, hovered: bool) -> None:
 
 
 def draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
-             vx_r, vy_r, w, status, fps, cup_on_robot=False):
+             vx_r, vy_r, w, status, fps, cup_on_robot=False, link=""):
     """디버그 오버레이."""
     h, wpx = frame.shape[:2]
 
@@ -156,6 +160,9 @@ def draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
         f"scale {world.px_per_cm:.2f}px/cm  {fps:4.1f}fps",
         (200, 200, 200), 0.45,
     ))
+    if link:
+        ok = "fault=NONE" in link
+        panel.append((link, (0, 220, 0) if ok else (0, 165, 255), 0.45))
     if field.in_local_minima:
         panel.append(("LOCAL MINIMA - escaping", (0, 200, 255), 0.5))
     if not field.has_goal:
@@ -171,7 +178,7 @@ def draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
                     size, color, 2 if size >= 0.6 else 1)
         y += int(28 * max(size, 0.6))
 
-    cv2.putText(frame, "q=quit  space=pause", (10, h - 12),
+    cv2.putText(frame, "q=quit  space=pause  r=reset fault", (10, h - 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
 
 
@@ -317,7 +324,7 @@ def main() -> None:
                 )
                 w_cmd = heading_command(
                     field.vx_world, field.vy_world, robot.heading_rad
-                )
+                ) if config.HEADING_CONTROL else 0.0
             else:
                 # 로봇 위치를 모르면 어떤 방향으로 보낼지 알 수 없다. 무조건 정지.
                 vx_r = vy_r = w_cmd = 0.0
@@ -340,12 +347,20 @@ def main() -> None:
             if now - last_print_t > (1.0 / config.PRINT_HZ):
                 last_print_t = now
                 d_txt = f"{risk.distance_cm:.1f}cm" if risk.distance_cm is not None else "-"
+                # 컵에 가장 가까운 손의 그립 지표 (* = 모양 조건 충족). 임계값 튜닝용.
+                nh = (hands.nearest_to(cup.x_cm, cup.y_cm)
+                      if hands is not None and hands.detected and cup else None)
+                hand_txt = (f"ap{nh.aperture:.2f}/op{nh.openness:.2f}"
+                            f"{'*' if nh.grasp_ready else ''}"
+                            if nh is not None and nh.valid else "-")
                 print(
                     f"[{status:4}] risk={risk.level:6} d={d_txt:>8} "
                     f"v=({vx_r:+6.1f},{vy_r:+6.1f})cm/s w={w_cmd:+5.2f} "
                     f"robot={'O' if robot.detected else 'X'} "
                     f"cup={'O' if cup else 'X'} obs={len(obstacles)} "
-                    f"[{'ArUco' if use_marker else 'YOLO'}] {fps:.1f}fps"
+                    f"[{'ArUco' if use_marker else 'YOLO'}] {fps:.1f}fps "
+                    f"hand={hand_txt} grip={'Y' if risk.intent_grip else 'n'} "
+                    f"why={risk.reason}"
                 )
 
             # 설정 패널: 바뀐 값을 config에 반영하고 현재 측정값을 보낸다.
@@ -372,6 +387,7 @@ def main() -> None:
                 "detector": ("ArUco(test)" if use_marker else "YOLO")
                             + f"  cup={'O' if cup else 'X'} obstacle={len(obstacles)}",
                 "cup on robot": "YES" if cup_on_robot else "no",
+                "esp32": sender.link_text(),
                 "FPS": f"{fps:.1f}",
             })
 
@@ -389,7 +405,8 @@ def main() -> None:
                     marker_detector.draw(frame, world, detections)
                 robot_tracker.draw(frame, robot, world)
                 draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
-                         vx_r, vy_r, w_cmd, status, fps, cup_on_robot=cup_on_robot)
+                         vx_r, vy_r, w_cmd, status, fps, cup_on_robot=cup_on_robot,
+                         link=sender.link_text())
                 draw_settings_button(frame, mouse_state["hover"])
                 if paused:
                     cv2.putText(frame, "PAUSED", (config.FRAME_WIDTH // 2 - 90, 60),
@@ -409,6 +426,8 @@ def main() -> None:
                     print(f"[일시정지] {paused}")
                 if key == ord('t'):
                     panel.toggle()
+                if key == ord('r'):
+                    sender.reset_fault()
 
     except KeyboardInterrupt:
         print("\n[중단] Ctrl+C")

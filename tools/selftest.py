@@ -305,6 +305,60 @@ ev5 = RiskEvaluator()
 s = ev5.evaluate(FakeHuman(detected=False, joints=[]), None, 5000.0)
 check("사람/컵 미검출 -> SAFE", s.level == "SAFE" and s.distance_cm is None)
 
+# ---- 엄격한 그립 판정 ----
+from perception.hand_tracker import HandInfo, HandsResult  # noqa: E402
+
+C_SHAPE = dict(aperture=1.1, openness=2.0)   # 컵을 감싸는 C자
+
+
+def hand(x, aperture, openness):
+    return HandInfo(wrist_x_cm=x, wrist_y_cm=0.0, aperture=aperture,
+                    openness=openness, valid=True)
+
+
+check("C자 손 -> 잡기 모양", hand(0, **C_SHAPE).grasp_ready)
+check("편 손 -> 잡기 모양 아님", not hand(0, 2.0, 2.8).grasp_ready)
+check("주먹 -> 잡기 모양 아님", not hand(0, 0.9, 1.3).grasp_ready)
+check("집기(pinch) -> 잡기 모양 아님", not hand(0, 0.2, 2.0).grasp_ready)
+
+
+def run_grip(hands_fn, n, step_cm=0.0, start=10.0, t0=6000.0):
+    """손목을 start에서 매 프레임 step_cm씩 컵 쪽으로 옮기며 n프레임 평가."""
+    e = RiskEvaluator()
+    t, d, s = t0, start, None
+    for _ in range(n):
+        t += 0.05
+        d = max(d - step_cm, 1.0)
+        s = e.evaluate(FakeHuman(joints=[FakeJoint(d, 0.0)]), cup0, t, hands=hands_fn(d))
+    return s
+
+
+# 34cm에서 C자 손으로 10cm/s로 천천히 다가와 컵을 잡는다 (3초, 마지막 4cm)
+s = run_grip(lambda d: HandsResult(True, [hand(d, **C_SHAPE)]), 60, step_cm=0.5, start=34.0)
+check("C자 손으로 천천히 다가와 잡음 -> SAFE (정상 픽업)", s.level == "SAFE",
+      f"got {s.level} ({s.reason})")
+
+s = run_grip(lambda d: HandsResult(True, [hand(d, **C_SHAPE)]), 3)
+check("C자 손 0.15s만 -> 아직 grip 아님 (확정시간)", not s.intent_grip and s.level == "DANGER",
+      f"got {s.level} grip={s.intent_grip}")
+
+s = run_grip(lambda d: HandsResult(True, [hand(d, 2.0, 2.8), hand(80.0, **C_SHAPE)]), 20)
+check("컵에서 먼 다른 손이 C자 -> grip 아님", not s.intent_grip and s.level == "DANGER",
+      f"got {s.level} grip={s.intent_grip}")
+
+s = run_grip(lambda d: HandsResult(True, [hand(d, **C_SHAPE)]), 20, start=60.0)
+check("컵에서 35cm 밖의 C자 손 -> grip 아님", not s.intent_grip, f"grip={s.intent_grip}")
+
+# C자 모양으로 0.5s 가까이 머문 뒤(grip 확정) 100cm/s로 휘두름
+e = RiskEvaluator()
+t, levels = 7000.0, []
+for d in [34.0] * 10 + [34.0 - 5.0 * i for i in range(1, 7)]:
+    t += 0.05
+    s = e.evaluate(FakeHuman(joints=[FakeJoint(d, 0.0)]), cup0, t,
+                   hands=HandsResult(True, [hand(d, **C_SHAPE)]))
+    levels.append((s.level, s.intent_grip))
+check("C자여도 고속 접근 -> DANGER", ("DANGER", True) in levels, f"levels={levels[-6:]}")
+
 # ============================================================
 print("\n[5] 3륜 옴니 역기구학 (ESP32 펌웨어와 동일한 식)")
 # ============================================================
@@ -341,15 +395,27 @@ check("역기구학 선형성", all(abs(a[i] + b[i] - c[i]) < 1e-9 for i in rang
 # ============================================================
 print("\n[4] 전송 계층 - JSON 직렬화")
 # ============================================================
-from comm.udp_sender import CommandPacket  # noqa: E402
+from comm.udp_sender import CommandPacket, clamp_to_firmware  # noqa: E402
 
 import json  # noqa: E402
-pkt = CommandPacket(seq=42, t=1699.123456, vx=12.3456, vy=-4.5678, w=0.35, status="RUN")
+pkt = CommandPacket(type="cmd_vel", session_id=7, seq=42,
+                    vx=12.3456, vy=-4.5678, w=0.35, status="RUN")
 decoded = json.loads(pkt.to_json())
-check("JSON 키가 ESP32 파서와 일치",
-      set(decoded) == {"seq", "t", "vx", "vy", "w", "status"}, f"got {set(decoded)}")
+check("JSON 키가 ESP32 typed 파서와 일치",
+      set(decoded) == {"type", "session_id", "seq", "vx", "vy", "w", "status"},
+      f"got {set(decoded)}")
 check("소수점 3자리 반올림", decoded["vx"] == 12.346, f"got {decoded['vx']}")
 check("패킷 크기 < 512B (ESP32 버퍼)", len(pkt.to_json()) < 512, f"{len(pkt.to_json())}B")
+stop = json.loads(CommandPacket(type="stop", session_id=7, seq=43).to_json())
+check("stop 패킷에는 속도 필드가 없음", set(stop) == {"type", "session_id", "seq"}, f"got {set(stop)}")
+
+cvx, cvy, cw = clamp_to_firmware(30.0, 40.0, -5.0)
+check("펌웨어 선속도 한계로 클램프",
+      abs(math.hypot(cvx, cvy) - config.FIRMWARE_LINEAR_LIMIT_CM_S) < 1e-9)
+check("클램프 후 방향 유지", abs(cvy / cvx - 40.0 / 30.0) < 1e-9)
+check("펌웨어 각속도 한계로 클램프", cw == -config.FIRMWARE_ANGULAR_LIMIT_RAD_S)
+check("펌웨어 SPEED_LIMIT 폴트 기준(30cm/s, 2rad/s) 미만",
+      config.FIRMWARE_LINEAR_LIMIT_CM_S < 30.0 and config.FIRMWARE_ANGULAR_LIMIT_RAD_S < 2.0)
 
 # ============================================================
 print("\n" + "=" * 50)

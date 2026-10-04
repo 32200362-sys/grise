@@ -73,13 +73,14 @@ class HandInfo:
     def grasp_ready(self) -> bool:
         """
         '잡으려고 손 모양을 만든 상태'인지 대략 판정.
-        완전히 편 손도, 꽉 쥔 주먹도 아닌 중간 상태를 잡기 준비로 본다.
+        완전히 편 손도, 꽉 쥔 주먹도 아닌 중간 상태(컵을 감싸는 C자)를 잡기 준비로 본다.
+        openness 하한이 없으면 주먹도 통과한다.
         """
         if not self.valid:
             return False
         return (
             config.GRIP_APERTURE_MIN <= self.aperture <= config.GRIP_APERTURE_MAX
-            and self.openness <= config.GRIP_OPENNESS_MAX
+            and config.GRIP_OPENNESS_MIN <= self.openness <= config.GRIP_OPENNESS_MAX
         )
 
 
