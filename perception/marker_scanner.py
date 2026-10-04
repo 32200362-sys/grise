@@ -71,18 +71,43 @@ class MarkerScanner:
         params = cv2.aruco.DetectorParameters()
         # 서브픽셀 코너 정밀화 - heading 정확도가 눈에 띄게 좋아진다.
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        params.adaptiveThreshWinSizeMax = config.ARUCO_THRESH_WIN_MAX
+        params.adaptiveThreshWinSizeStep = config.ARUCO_THRESH_WIN_STEP
         self._detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+
+    @staticmethod
+    def _known_ids() -> set[int]:
+        """재검출에서 받아들일 ID: 로봇 + config.MARKER_OBJECTS (오검출 방어)."""
+        return {config.ROBOT_MARKER_ID} | set(config.MARKER_OBJECTS)
+
+    @staticmethod
+    def _collect(out: dict, corners, ids, scale: float = 1.0, only=None) -> None:
+        if ids is None:
+            return
+        for c, i in zip(corners, ids.flatten()):
+            mid = int(i)
+            if only is not None and mid not in only:
+                continue
+            cand = c[0] / scale
+            # 같은 ID가 여러 개 잡히면 가장 큰 것(가까운 것)을 택한다.
+            if mid not in out or MarkerScan.side_px(cand) > MarkerScan.side_px(out[mid]):
+                out[mid] = cand
 
     def scan(self, frame) -> MarkerScan:
         corners, ids, _ = self._detector.detectMarkers(frame)
         out: dict[int, np.ndarray] = {}
-        if ids is not None:
-            for c, i in zip(corners, ids.flatten()):
-                # 같은 ID가 여러 개 잡히면 가장 큰 것(가까운 것)을 택한다.
-                mid = int(i)
-                cand = c[0]
-                if mid not in out or MarkerScan.side_px(cand) > MarkerScan.side_px(out[mid]):
-                    out[mid] = cand
+        self._collect(out, corners, ids)
+
+        # 모션블러로 로봇 마커를 놓쳤으면 영상을 줄여 다시 찾는다.
+        # 블러 길이가 같이 줄어들어 검출이 되살아난다. 놓친 프레임에만 비용이 든다.
+        if config.ROBOT_MARKER_ID not in out:
+            known = self._known_ids()
+            for s in config.ARUCO_FALLBACK_SCALES:
+                small = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+                c2, i2, _ = self._detector.detectMarkers(small)
+                self._collect(out, c2, i2, scale=s, only=known - set(out))
+                if config.ROBOT_MARKER_ID in out:
+                    break
         return MarkerScan(by_id=out)
 
     def draw(self, frame, scan: MarkerScan) -> None:

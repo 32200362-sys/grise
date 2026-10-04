@@ -155,7 +155,7 @@ def draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
         (255, 255, 255), 0.5,
     ))
     panel.append((
-        f"robot {'OK ' if robot.detected else 'LOST'}  "
+        f"robot {'HOLD' if robot.held else ('OK ' if robot.detected else 'LOST')}  "
         f"heading {math.degrees(robot.heading_rad):+6.1f}deg  "
         f"scale {world.px_per_cm:.2f}px/cm  {fps:4.1f}fps",
         (200, 200, 200), 0.45,

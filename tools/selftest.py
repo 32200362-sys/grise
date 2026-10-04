@@ -490,6 +490,102 @@ check("펌웨어 SPEED_LIMIT 폴트 기준(30cm/s, 2rad/s) 미만",
       config.FIRMWARE_LINEAR_LIMIT_CM_S < 30.0 and config.FIRMWARE_ANGULAR_LIMIT_RAD_S < 2.0)
 
 # ============================================================
+print("\n[6] 로봇 마커 인식 강건성")
+# ============================================================
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+from perception.marker_scanner import MarkerScan, MarkerScanner  # noqa: E402
+from perception.robot_tracker import RobotTracker  # noqa: E402
+
+_rng = np.random.default_rng(0)
+_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, config.ARUCO_DICT_NAME))
+
+
+def marker_frame(marker_id, side=130, blur=0, contrast=1.0, cx=640, cy=360):
+    """흰 여백이 있는 ArUco를 회색 배경 위에 그린다 (이미지 파일 없이 생성)."""
+    m = cv2.aruco.generateImageMarker(_dict, marker_id, side)
+    m = cv2.copyMakeBorder(m, side // 5, side // 5, side // 5, side // 5, cv2.BORDER_CONSTANT, value=255)
+    m = (m.astype(np.float32) * contrast + 127 * (1 - contrast)).clip(0, 255).astype(np.uint8)
+    img = np.full((720, 1280), 110, np.uint8)
+    h, w = m.shape
+    img[cy - h // 2:cy - h // 2 + h, cx - w // 2:cx - w // 2 + w] = m
+    if blur > 1:
+        k = np.zeros((blur, blur), np.float32)
+        k[blur // 2, :] = 1.0 / blur
+        img = cv2.filter2D(img, -1, k)
+    return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+
+scanner = MarkerScanner()
+check("선명한 마커 -> 검출", config.ROBOT_MARKER_ID in scanner.scan(marker_frame(config.ROBOT_MARKER_ID)))
+
+saved = config.ARUCO_FALLBACK_SCALES
+blurred = marker_frame(config.ROBOT_MARKER_ID, blur=15)
+config.ARUCO_FALLBACK_SCALES = ()
+found_plain = config.ROBOT_MARKER_ID in scanner.scan(blurred)
+config.ARUCO_FALLBACK_SCALES = saved
+found_fb = config.ROBOT_MARKER_ID in scanner.scan(blurred)
+check("흐린 마커(15px): 축소 재검출이 있으면 검출", found_fb, f"fallback={found_fb} plain={found_plain}")
+
+sc = scanner.scan(blurred)
+c = sc.get(config.ROBOT_MARKER_ID)
+check("재검출 좌표가 원본 해상도로 복원됨(중심 오차 < 6px)",
+      c is not None and abs(MarkerScan.center_px(c)[0] - 640) < 6 and abs(MarkerScan.center_px(c)[1] - 360) < 6,
+      f"center={MarkerScan.center_px(c) if c is not None else None}")
+
+check("저대비 마커(0.35) 검출",
+      config.ROBOT_MARKER_ID in scanner.scan(marker_frame(config.ROBOT_MARKER_ID, contrast=0.35)))
+
+# 모르는 ID(config에 없는 ID)는 재검출 결과로 받아들이지 않는다
+unknown = max([config.ROBOT_MARKER_ID, *config.MARKER_OBJECTS]) + 7
+sc_unknown = scanner.scan(marker_frame(unknown, blur=15))
+check("흐림 재검출은 알려진 ID만 수용 (모르는 ID 무시)", unknown not in sc_unknown, f"ids={sc_unknown.ids}")
+
+# 마커 없는 지저분한 장면에서 로봇/컵/장애물 ID 오검출이 없어야 한다
+known = {config.ROBOT_MARKER_ID} | set(config.MARKER_OBJECTS)
+bad = 0
+for _ in range(60):
+    g = cv2.GaussianBlur(_rng.integers(60, 200, (720, 1280), dtype=np.uint8), (0, 0), 6)
+    for _ in range(50):
+        x, y = int(_rng.integers(0, 1200)), int(_rng.integers(0, 650))
+        w, h = int(_rng.integers(15, 160)), int(_rng.integers(15, 160))
+        cv2.rectangle(g, (x, y), (x + w, y + h), int(_rng.choice([0, 255])), int(_rng.choice([2, 4, -1])))
+    bad += len(known & set(scanner.scan(cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)).ids))
+check("마커 없는 지저분한 장면 -> 알려진 ID 오검출 0", bad == 0, f"false known-id detections={bad}")
+
+
+class _World:
+    px_per_cm = 10.0
+
+    def update_scale(self, s):
+        self.px_per_cm = s
+
+    def to_world(self, x, y):
+        return x / 10.0, (720 - y) / 10.0
+
+
+tracker = RobotTracker()
+corners = np.array([[600, 330], [680, 330], [680, 410], [600, 410]], dtype=float)
+seen = MarkerScan(by_id={config.ROBOT_MARKER_ID: corners})
+lost = MarkerScan(by_id={})
+w0 = _World()
+t0 = 10000.0
+p = tracker.process(None, w0, seen, now=t0)
+check("마커 보임 -> detected, held 아님", p.detected and not p.held)
+p = tracker.process(None, w0, lost, now=t0 + config.ROBOT_HOLD_S * 0.5)
+check("순간 놓침(HOLD 이내) -> 직전 자세 유지 (detected, held)", p.detected and p.held,
+      f"detected={p.detected} held={p.held}")
+check("유지 중 위치는 직전 값", abs(p.x_cm - 64.0) < 1e-6, f"x={p.x_cm}")
+p = tracker.process(None, w0, lost, now=t0 + config.ROBOT_HOLD_S + 0.05)
+check("HOLD 초과 -> detected=False (STOP 대상)", (not p.detected) and (not p.held), f"detected={p.detected}")
+p = tracker.process(None, w0, lost, now=t0 + 5.0)
+check("오래 못 봄 -> 계속 detected=False", not p.detected)
+p = tracker.process(None, w0, seen, now=t0 + 6.0)
+check("다시 보이면 detected 복귀", p.detected and not p.held)
+check("한 번도 못 본 상태 -> detected=False", not RobotTracker().process(None, w0, lost, now=t0).detected)
+
+
+# ============================================================
 print("\n" + "=" * 50)
 print(f"결과: {passed} PASS / {failed} FAIL")
 print("=" * 50)

@@ -19,6 +19,7 @@ atan2로 각도를 구하면 반시계(CCW) 양수인 표준 각도가 된다.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -34,6 +35,7 @@ class RobotPose:
     y_cm: float = 0.0
     heading_rad: float = 0.0     # 월드 +X축 기준 반시계 양수
     px: tuple[float, float] = (0.0, 0.0)
+    held: bool = False           # True면 이번 프레임은 못 봤고 직전 자세를 잠깐 유지하는 중
 
 
 def _wrap_pi(a: float) -> float:
@@ -47,19 +49,24 @@ class RobotTracker:
         # 같은 detectMarkers() 결과를 공유하기 위해서다.
         self._scanner = MarkerScanner()
         self._last = RobotPose()
+        self._last_seen_t = -1e9
         self._heading_offset = math.radians(config.MARKER_HEADING_OFFSET_DEG)
 
-    def process(self, frame, world, scan=None) -> RobotPose:
+    def process(self, frame, world, scan=None, now: float | None = None) -> RobotPose:
         """scan을 넘기면 재검출하지 않는다 (프레임당 detectMarkers 1회)."""
+        now = time.time() if now is None else now
         if scan is None:
             scan = self._scanner.scan(frame)
 
         target = scan.get(config.ROBOT_MARKER_ID)
 
         if target is None:
-            # 놓친 프레임은 직전 자세를 유지하되 detected=False로 알린다.
+            # 순간적으로 놓친 경우(ROBOT_HOLD_S 이내)는 직전 자세로 계속 움직인다 (held=True).
+            # 그보다 오래 안 보이면 detected=False -> 상위에서 STOP.
+            held = self._last.detected and (now - self._last_seen_t) <= config.ROBOT_HOLD_S
             return RobotPose(
-                detected=False,
+                detected=held,
+                held=held,
                 x_cm=self._last.x_cm,
                 y_cm=self._last.y_cm,
                 heading_rad=self._last.heading_rad,
@@ -78,13 +85,14 @@ class RobotTracker:
 
         # --- EMA 스무딩 ---
         a = config.ROBOT_POSE_EMA_ALPHA
-        if self._last.detected:
+        if self._last.detected and (now - self._last_seen_t) <= config.ROBOT_HOLD_S:
             x_cm = (1 - a) * self._last.x_cm + a * x_cm
             y_cm = (1 - a) * self._last.y_cm + a * y_cm
             # 각도는 -pi/pi 경계를 넘을 수 있어 차이를 wrap한 뒤 보간해야 한다.
             d = _wrap_pi(heading - self._last.heading_rad)
             heading = _wrap_pi(self._last.heading_rad + a * d)
 
+        self._last_seen_t = now
         self._last = RobotPose(
             detected=True,
             x_cm=x_cm,
