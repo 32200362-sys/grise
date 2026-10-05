@@ -32,8 +32,10 @@ ESP32 주소 찾기
 
 from __future__ import annotations
 
+import csv
 import json
 import math
+import os
 import random
 import socket
 import time
@@ -85,19 +87,24 @@ class UdpSender:
         self.esp_ip: str | None = ip or config.ESP32_IP
         self.auto_discover = self.esp_ip is None
 
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self._sock.setblocking(False)
-
-        # 텔레메트리 수신 소켓. 포트가 이미 쓰이면 수신 없이 송신만 한다.
+        # 명령 송신과 텔레메트리 수신에 같은 소켓(로컬 포트 8889)을 쓴다.
+        # 로봇은 텔레메트리를 PC:8889로 보내는데, PC가 8889에서 로봇:8888로 명령을 보내면
+        # Windows 방화벽(UDP 상태 추적)이 로봇의 응답을 "내가 보낸 요청의 답"으로 보고 통과시킨다.
+        # -> 방화벽 규칙을 따로 만들지 않아도 로봇 상태(폴트 등)를 받을 수 있다.
         self._rx: socket.socket | None = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
+            self._rx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             self._rx.bind(("0.0.0.0", config.TELEMETRY_PORT))
             self._rx.setblocking(False)
+            self._sock = self._rx
         except OSError as e:
+            # 포트가 이미 쓰이면 송신만 따로 한다 (텔레메트리 없음).
             print(f"[UDP] 텔레메트리 포트 {config.TELEMETRY_PORT} 사용 불가: {e}")
             self._rx.close()
             self._rx = None
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self._sock.setblocking(False)
 
         self.session_id = random.randint(1, 0xFFFFFFFF)
         self._seq = 0
@@ -113,6 +120,14 @@ class UdpSender:
 
         self.sent_count = 0
         self.error_count = 0
+        self._reset_times: list[float] = []     # 자동 리셋을 보낸 시각들
+        self._fault_seen_t: float | None = None  # 처리 대상 폴트를 처음 본 시각
+        self._auto_reset_warned = False
+        self.auto_reset_count = 0
+        self._log_fh = None
+        self._log_writer = None
+        self._last_cmd_t = 0.0
+        self.max_gap_s = 0.0          # 마지막 통계 이후 명령 사이 최장 간격
 
         if self.auto_discover:
             print(f"[UDP] ESP32 자동 탐색 (브로드캐스트 {', '.join(config.ESP32_BROADCAST_IPS)}"
@@ -140,8 +155,10 @@ class UdpSender:
         if not self.connected:
             return f"ESP32 {self.esp_ip} no telemetry"
         t = self.telemetry
-        return (f"ESP32 {self.esp_ip} {t.get('state')} fault={t.get('fault')} "
-                f"rssi={t.get('wifi_rssi')}")
+        fault = t.get("fault")
+        warn = "  <<< ROBOT FAULT: press r to reset" if fault not in (None, "NONE") else ""
+        return (f"ESP32 {self.esp_ip} {t.get('state')} fault={fault} "
+                f"rssi={t.get('wifi_rssi')} age={t.get('command_age_ms')}ms{warn}")
 
     # ------------------------------------------------------------------ 송신
     def _packet(self, type_: str, **kw) -> CommandPacket:
@@ -179,6 +196,7 @@ class UdpSender:
         """
         now = time.time()
         self.poll()
+        self._service_auto_reset(now)
 
         if self.esp_ip is None:
             if now - self._last_discover_t > 0.5:
@@ -199,8 +217,17 @@ class UdpSender:
             pkt = self._packet("cmd_vel", vx=vx, vy=vy, w=w, status=status)
 
         self._send_packet(pkt)
+        if self._last_cmd_t > 0.0:
+            self.max_gap_s = max(self.max_gap_s, now - self._last_cmd_t)
+        self._last_cmd_t = now
         self._last_send_t = now
         return pkt
+
+    def take_max_gap_ms(self) -> int:
+        """마지막 호출 이후 명령 간 최장 간격(ms)을 돌려주고 초기화한다. 300ms를 넘으면 로봇 watchdog이 정지시킨다."""
+        g = int(self.max_gap_s * 1000)
+        self.max_gap_s = 0.0
+        return g
 
     def send_stop(self) -> None:
         """즉시 정지 명령. 종료 시와 예외 발생 시 여러 번 보낸다 (유실 대비)."""
@@ -211,6 +238,65 @@ class UdpSender:
                 self._send_packet(self._packet("stop"))
             time.sleep(0.01)
 
+    def _service_auto_reset(self, now: float) -> None:
+        """MOTOR_STALL 같은 래치 폴트를 자동으로 푼다 (횟수 제한). 사람이 'r'을 누르면 횟수 제한도 초기화된다."""
+        if not config.ROBOT_AUTO_RESET or not self.connected:
+            return
+        fault = self.telemetry.get("fault")
+        if fault not in config.ROBOT_AUTO_RESET_FAULTS:
+            self._fault_seen_t = None
+            return
+        if self._fault_seen_t is None:
+            self._fault_seen_t = now
+            return
+        if now - self._fault_seen_t < config.ROBOT_AUTO_RESET_WAIT_S:
+            return
+        window = config.ROBOT_AUTO_RESET_WINDOW_S
+        self._reset_times = [x for x in self._reset_times if now - x < window]
+        if len(self._reset_times) >= config.ROBOT_AUTO_RESET_MAX:
+            if not self._auto_reset_warned:
+                self._auto_reset_warned = True
+                print(f"[ESP32] {fault} 자동 리셋 한도({config.ROBOT_AUTO_RESET_MAX}회/{window:.0f}s) 초과 - "
+                      "바퀴가 막혔는지 확인하고 'r' 키로 리셋하세요")
+            return
+        self._reset_times.append(now)
+        self.auto_reset_count += 1
+        self._fault_seen_t = now          # 다음 시도까지 WAIT만큼 다시 기다린다
+        print(f"[ESP32] {fault} 자동 리셋 ({len(self._reset_times)}/{config.ROBOT_AUTO_RESET_MAX})")
+        self._send_reset_sequence()
+
+    def _send_reset_sequence(self) -> None:
+        for type_ in ("stop", "reset_fault", "heartbeat"):
+            self._send_packet(self._packet(type_))
+
+    def _log_telemetry(self, msg: dict, now: float) -> None:
+        if not config.TELEMETRY_LOG:
+            return
+        try:
+            if self._log_writer is None:
+                os.makedirs("logs", exist_ok=True)
+                path = os.path.join("logs", time.strftime("telemetry_%Y%m%d_%H%M%S.csv"))
+                self._log_fh = open(path, "w", newline="", encoding="utf-8")
+                self._log_writer = csv.writer(self._log_fh)
+                self._log_writer.writerow(
+                    ["t", "fault", "mode", "state", "cmd_vx", "cmd_vy", "cmd_w", "age_ms",
+                     "tgt1", "tgt2", "tgt3", "spd1", "spd2", "spd3", "pwm1", "pwm2", "pwm3",
+                     "enc1", "enc2", "enc3", "rssi"])
+                print(f"[UDP] 텔레메트리 기록: {path}")
+
+            def tri(key):
+                v = msg.get(key) or [None, None, None]
+                return (list(v) + [None] * 3)[:3]
+
+            self._log_writer.writerow(
+                [f"{now:.3f}", msg.get("fault"), msg.get("mode"), msg.get("state"),
+                 msg.get("cmd_vx"), msg.get("cmd_vy"), msg.get("cmd_w"), msg.get("command_age_ms"),
+                 *tri("wheel_target"), *tri("wheel_speed"), *tri("wheel_pwm"), *tri("encoder_count"),
+                 msg.get("wifi_rssi")])
+            self._log_fh.flush()
+        except OSError:
+            self._log_writer = None           # 기록 실패는 제어에 영향을 주지 않는다
+
     def reset_fault(self) -> None:
         """
         래치된 폴트 해제 요청. 펌웨어는 reset_fault 뒤 handshake(heartbeat)가 와야 푼다.
@@ -219,9 +305,11 @@ class UdpSender:
         if self.esp_ip is None:
             print("[UDP] ESP32를 아직 찾지 못해 폴트 리셋을 보낼 수 없습니다.")
             return
-        for type_ in ("stop", "reset_fault", "heartbeat"):
-            self._send_packet(self._packet(type_))
+        self._send_reset_sequence()
         self._warned_fault = None
+        self._reset_times = []
+        self._auto_reset_warned = False
+        self._fault_seen_t = None
         print("[UDP] 폴트 리셋 요청 전송")
 
     # ------------------------------------------------------------------ 수신
@@ -247,6 +335,7 @@ class UdpSender:
                 continue
             self.telemetry = msg
             self.telemetry_t = time.time()
+            self._log_telemetry(msg, self.telemetry_t)
         self._report_state()
 
     def _report_state(self) -> None:
@@ -259,7 +348,7 @@ class UdpSender:
                 print(f"[ESP32] 폴트 {fault} - heartbeat로 자동 해제 시도")
                 self._last_heartbeat_t = 0.0
             else:
-                print(f"[ESP32] 폴트 {fault} (래치) - 원인 확인 후 'r' 키로 리셋")
+                print(f"[ESP32] 폴트 {fault} (래치) - 로봇은 리셋 전까지 모든 움직임 명령을 무시한다. 원인 확인 후 'r' 키로 리셋")
         elif fault == "NONE" and self._warned_fault is not None:
             print("[ESP32] 폴트 해제")
             self._warned_fault = None
@@ -273,4 +362,6 @@ class UdpSender:
         self._sock.close()
         if self._rx is not None:
             self._rx.close()
+        if self._log_fh is not None:
+            self._log_fh.close()
         print(f"[UDP] 종료. 전송 {self.sent_count}건, 실패 {self.error_count}건")

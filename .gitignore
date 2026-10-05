@@ -25,3 +25,9 @@ markers/
 
 # 위기 상황 스크린샷
 incidents/
+
+# 그립 캘리브레이션 샘플 (사용자별)
+grip_samples.csv
+
+# 로봇 텔레메트리 기록
+logs/

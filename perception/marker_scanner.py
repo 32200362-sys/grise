@@ -77,8 +77,8 @@ class MarkerScanner:
 
     @staticmethod
     def _known_ids() -> set[int]:
-        """재검출에서 받아들일 ID: 로봇 + config.MARKER_OBJECTS (오검출 방어)."""
-        return {config.ROBOT_MARKER_ID} | set(config.MARKER_OBJECTS)
+        """재검출에서 받아들일 ID: 로봇 + 컵/장애물 + 안전영역 모서리 (오검출 방어)."""
+        return {config.ROBOT_MARKER_ID} | set(config.MARKER_OBJECTS) | set(config.ARENA_CORNER_IDS)
 
     @staticmethod
     def _collect(out: dict, corners, ids, scale: float = 1.0, only=None) -> None:

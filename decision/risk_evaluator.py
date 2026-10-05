@@ -80,6 +80,11 @@ class RiskEvaluator:
         self._grip_since: float | None = None   # grip 모양이 (짧은 끊김 허용하며) 이어진 시작 시각
         self._grip_last_shape = -1e9            # grip 모양이 마지막으로 보인 시각
 
+    def clear_hold(self) -> None:
+        """손이 안전 영역 밖에 있다고 확실할 때 위험 등급 유지(hold)를 끊는다."""
+        self._held_level = "SAFE"
+        self._held_until = 0.0
+
     def reset(self) -> None:
         """컵이나 사람을 놓쳤을 때 미분 상태를 버린다 (재등장 시 속도 폭주 방지)."""
         self._dist_ema = None

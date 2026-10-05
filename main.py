@@ -41,6 +41,7 @@ import config
 from comm import UdpSender
 from decision import RiskEvaluator
 from perception import (
+    Arena,
     Camera,
     GazeTracker,
     HandTracker,
@@ -50,7 +51,7 @@ from perception import (
     PoseTracker,
     RobotTracker,
 )
-from planning import PotentialField, heading_command, to_body_command
+from planning import PotentialField, geofence, heading_command, to_body_command
 from safety import IncidentLogger
 from ui import SettingsPanel, load_tuning
 
@@ -162,7 +163,9 @@ def draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
     ))
     if link:
         ok = "fault=NONE" in link
-        panel.append((link, (0, 220, 0) if ok else (0, 165, 255), 0.45))
+        bad = "ROBOT FAULT" in link
+        panel.append((link, (0, 220, 0) if ok else ((0, 0, 255) if bad else (0, 165, 255)),
+                      0.6 if bad else 0.45))
     if field.in_local_minima:
         panel.append(("LOCAL MINIMA - escaping", (0, 200, 255), 0.5))
     if not field.has_goal:
@@ -223,6 +226,7 @@ def main() -> None:
         except RuntimeError as e:
             print(f"[Gaze] 비활성화: {str(e).splitlines()[0]}")
 
+    arena = Arena()
     risk_eval = RiskEvaluator()
     field_planner = PotentialField()
     sender = UdpSender()
@@ -273,6 +277,7 @@ def main() -> None:
             # 마커는 한 번만 스캔해서 로봇 추적과 물체 검출이 나눠 쓴다.
             scan = scanner.scan(frame)
             robot = robot_tracker.process(frame, world, scan)
+            arena.update(scan, now)
 
             # 테스트 모드면 YOLO 대신 ArUco로 컵/장애물을 인식한다.
             # 설정 패널에서 실행 중에 전환할 수 있으므로 매 프레임 확인한다.
@@ -308,19 +313,48 @@ def main() -> None:
                     and (not human.detected or not human.wrists)):
                 human = hands.as_human_pose()
 
+            # ---------------- 안전 영역 (테이블 모서리 마커) ----------------
+            # 사람은 손목이 영역 안에 있을 때만 판단/회피 대상으로 삼는다.
+            arena_poly = arena.world_polygon(world, now) if config.ARENA_ENABLED else None
+            arena_wait = config.ARENA_ENABLED and config.ARENA_REQUIRED and arena_poly is None
+            human_zone = (arena.filter_human(human, arena_poly)
+                          if arena_poly is not None else human)
+
+            # 손목이 보이는데 전부 영역 밖이면 이전 위험 판정의 유지시간을 끊는다 (영역 밖의 팔에는 반응하지 않는다).
+            # 손목이 아예 안 보이는 경우(인식 끊김)는 유지시간을 그대로 둔다.
+            if arena_poly is not None and human.wrists and not human_zone.wrists:
+                risk_eval.clear_hold()
+
             # ---------------- [2] 판단 계층 ----------------
             # hands/gaze는 임계값을 넓히는 데만 쓰인다. 하드 정지는 거리·속도만 트리거한다.
-            risk = risk_eval.evaluate(human, cup, now, hands=hands, gaze=gaze)
+            risk = risk_eval.evaluate(human_zone, cup, now, hands=hands, gaze=gaze)
 
             # ---------------- [3] 경로계산 계층 ----------------
             field = field_planner.compute(
                 robot=robot,
                 cup=cup,
                 obstacles=obstacles,
-                human_pose=human,
+                human_pose=human_zone,
                 risk_level=risk.level,
                 now=now,
             )
+
+            # 로봇이 영역 밖으로 나가지 않게: 경계 밖으로 향하는 속도 성분을 줄인다 (월드 좌표).
+            arena_state = "off"
+            if arena_wait:
+                arena_state = "wait"
+            elif (arena_poly is not None
+                  and geofence.inset_polygon(arena_poly, config.ARENA_MARGIN_CM) is None):
+                # 안전 여백이 영역보다 커서 로봇이 있을 수 있는 곳이 없다 (여백이 너무 크거나 영역이 작다).
+                arena_state = "small"
+            elif arena_poly is not None and robot.detected:
+                gvx, gvy, arena_state = geofence.clamp_velocity(
+                    arena_poly, (robot.x_cm, robot.y_cm),
+                    (field.vx_world, field.vy_world),
+                    config.ARENA_MARGIN_CM, config.ARENA_EDGE_INFLUENCE_CM,
+                )
+                field.vx_world, field.vy_world = gvx, gvy
+                field.speed = math.hypot(gvx, gvy)
 
             # 월드 -> 로봇 좌표계 회전변환
             if robot.detected:
@@ -338,6 +372,11 @@ def main() -> None:
             if not robot.detected:
                 status = "STOP"
             if paused:
+                vx_r = vy_r = w_cmd = 0.0
+                status = "STOP"
+            # 영역을 아직 모르거나(모서리 마커 미확인), 여백이 너무 커서 갈 곳이 없으면 움직이지 않는다.
+            # (로봇이 영역 밖이면 정지하지 않고 안쪽으로 돌아오는 움직임만 허용한다 - geofence.clamp_velocity)
+            if arena_state in ("wait", "small"):
                 vx_r = vy_r = w_cmd = 0.0
                 status = "STOP"
 
@@ -364,6 +403,8 @@ def main() -> None:
                     f"robot={'O' if robot.detected else 'X'} "
                     f"cup={'O' if cup else 'X'} obs={len(obstacles)} "
                     f"[{'ArUco' if use_marker else 'YOLO'}] {fps:.1f}fps "
+                    f"zone={arena_state}/{len(human_zone.wrists)}w "
+                    f"net={'ok' if sender.connected else 'noTelemetry'}/{sender.fault or '-'}/gap{sender.take_max_gap_ms()}ms/rst{sender.auto_reset_count} "
                     f"hand={hand_txt} grip={'Y' if risk.intent_grip else 'n'} "
                     f"why={risk.reason}"
                 )
@@ -392,6 +433,7 @@ def main() -> None:
                 "detector": ("ArUco(test)" if use_marker else "YOLO")
                             + f"  cup={'O' if cup else 'X'} obstacle={len(obstacles)}",
                 "cup on robot": "YES" if cup_on_robot else "no",
+                "arena": f"{arena.status_text(world, now)}  {arena_state}  wrists-in-zone {len(human_zone.wrists)}",
                 "esp32": sender.link_text(),
                 "FPS": f"{fps:.1f}",
             })
@@ -409,6 +451,14 @@ def main() -> None:
                     scanner.draw(frame, scan)
                     marker_detector.draw(frame, world, detections)
                 robot_tracker.draw(frame, robot, world)
+                if config.ARENA_ENABLED:
+                    arena.draw(frame, world, now)
+                    ok_zone = arena_state in ("ok", "limited")
+                    cv2.putText(
+                        frame,
+                        f"{arena.status_text(world, now)}  zone={arena_state}  wrists-in-zone {len(human_zone.wrists)}",
+                        (10, config.FRAME_HEIGHT - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 220, 0) if ok_zone else (0, 165, 255), 1)
                 draw_hud(frame, world, robot, cup, obstacles, human, risk, field,
                          vx_r, vy_r, w_cmd, status, fps, cup_on_robot=cup_on_robot,
                          link=sender.link_text())

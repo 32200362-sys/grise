@@ -813,6 +813,351 @@ config.SEEK_CUP = _seek_saved
 
 
 # ============================================================
+print("\n[9] 안전 영역(arena): 로봇은 영역 안에만, 팔은 영역 안일 때만 반응")
+# ============================================================
+from planning import geofence  # noqa: E402
+from perception.arena import Arena  # noqa: E402
+
+SQ = geofence.order_ccw([(100.0, 100.0), (0.0, 0.0), (100.0, 0.0), (0.0, 100.0)])   # 100x100cm 테이블
+check("모서리를 CCW로 정렬", SQ[0] == (0.0, 0.0) or geofence.is_convex(SQ), f"{SQ}")
+check("정사각형은 볼록", geofence.is_convex(SQ))
+check("오목한 배치는 볼록 아님",
+      not geofence.is_convex(geofence.order_ccw([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (50.0, 40.0)])))
+check("안쪽 점의 부호거리 > 0", abs(geofence.signed_distance(SQ, (50.0, 50.0)) - 50.0) < 1e-9)
+check("바깥 점의 부호거리 < 0", geofence.signed_distance(SQ, (110.0, 50.0)) < 0)
+
+M, INF = config.ARENA_MARGIN_CM, config.ARENA_EDGE_INFLUENCE_CM
+vx_, vy_, st_ = geofence.clamp_velocity(SQ, (50.0, 50.0), (10.0, 0.0), M, INF)
+check("영역 한가운데 -> 속도 그대로", (vx_, vy_, st_) == (10.0, 0.0, "ok"), f"{(vx_, vy_, st_)}")
+vx_, vy_, st_ = geofence.clamp_velocity(SQ, (100.0 - M, 50.0), (10.0, 5.0), M, INF)
+check("경계선(margin)에서 바깥(+x) 성분 제거, 변을 따라가는 성분(y)은 유지",
+      abs(vx_) < 1e-9 and abs(vy_ - 5.0) < 1e-9 and st_ == "limited", f"{(vx_, vy_, st_)}")
+vx_, vy_, st_ = geofence.clamp_velocity(SQ, (100.0 - M - INF / 2, 50.0), (10.0, 0.0), M, INF)
+check("경계 근처(influence 안) -> 바깥 속도를 서서히 줄임", 0.0 < vx_ < 10.0, f"vx={vx_:.2f}")
+vx_, vy_, st_ = geofence.clamp_velocity(SQ, (100.0 - M, 50.0), (-10.0, 0.0), M, INF)
+check("경계에서도 안쪽으로 가는 속도는 허용", (vx_, vy_) == (-10.0, 0.0), f"{(vx_, vy_)}")
+vx_, vy_, st_ = geofence.clamp_velocity(SQ, (100.0 - M, 100.0 - M), (10.0, 10.0), M, INF)
+check("모서리에서는 두 방향 모두 막힘", abs(vx_) < 1e-9 and abs(vy_) < 1e-9, f"{(vx_, vy_)}")
+vx_, vy_, st_ = geofence.clamp_velocity(SQ, (110.0, 50.0), (-10.0, 3.0), M, INF)
+check("영역 밖에서 안쪽(-x)으로 돌아오는 속도는 허용 (정지하지 않음)", st_ == "outside" and (vx_, vy_) == (-10.0, 3.0), f"{(vx_, vy_, st_)}")
+vx_, vy_, st_ = geofence.clamp_velocity(SQ, (110.0, 50.0), (10.0, 3.0), M, INF)
+check("영역 밖에서 더 바깥(+x)으로 나가는 성분은 차단, 변을 따라가는 성분은 유지",
+      st_ == "outside" and abs(vx_) < 1e-9 and abs(vy_ - 3.0) < 1e-9, f"{(vx_, vy_, st_)}")
+inner = geofence.inset_polygon(SQ, M)
+check("안쪽으로 민 다각형 = margin만큼 줄어든 사각형",
+      inner is not None and all(abs(abs(x - 50.0) - (50.0 - M)) < 1e-6 and abs(abs(y - 50.0) - (50.0 - M)) < 1e-6 for x, y in inner),
+      f"{inner}")
+check("margin이 너무 크면 None", geofence.inset_polygon(SQ, 60.0) is None)
+
+# 모든 위치/방향에서 로봇이 경계를 넘지 않는다 (시뮬레이션: 사방으로 계속 밀어도 안 나감)
+import random as _r  # noqa: E402
+_r.seed(7)
+worst = 1e9
+for trial in range(200):
+    px_, py_ = _r.uniform(M, 100.0 - M), _r.uniform(M, 100.0 - M)
+    ang = _r.uniform(0, 2 * math.pi)
+    for _ in range(300):              # 15 cm/s로 6초간 같은 방향으로 계속 간다
+        ang += _r.uniform(-0.05, 0.05)
+        cvx, cvy, stt = geofence.clamp_velocity(SQ, (px_, py_), (15 * math.cos(ang), 15 * math.sin(ang)), M, INF)
+        px_ += cvx * 0.02
+        py_ += cvy * 0.02
+    worst = min(worst, geofence.signed_distance(SQ, (px_, py_)))
+check("무작위로 6초씩 200회 밀어도 로봇이 영역 안(margin 근처)에 머문다", worst >= M - 1.0,
+      f"최소 경계거리={worst:.2f}cm (margin={M})")
+
+
+class _W9:
+    px_per_cm = 10.0
+
+    def to_world(self, x, y):
+        return x / self.px_per_cm, (720 - y) / self.px_per_cm
+
+    def to_pixel(self, x, y):
+        return int(round(x * self.px_per_cm)), int(round(720 - y * self.px_per_cm))
+
+
+def _scan9(ids_pos):
+    return MarkerScan(by_id={i: np.array([[x - 5, y - 5], [x + 5, y - 5], [x + 5, y + 5], [x - 5, y + 5]], dtype=float)
+                             for i, (x, y) in ids_pos.items()})
+
+
+corner_px = dict(zip(config.ARENA_CORNER_IDS, [(200, 100), (1000, 100), (1000, 620), (200, 620)]))
+ids9 = list(corner_px)
+w9 = _W9()
+T0 = 1000.0
+
+
+def _frames(arena_, n, ids_pos, t0):
+    for k in range(n):
+        arena_.update(_scan9(ids_pos), t0 + k * 0.05)
+    return t0 + n * 0.05
+
+
+arena = Arena()
+t_now = _frames(arena, 20, {k: corner_px[k] for k in ids9[:3]}, T0)       # 3개만 보임
+check("네 모서리가 한 번도 같이 안 보이면 영역 미확정", not arena.ready(t_now) and arena.world_polygon(w9, t_now) is None)
+t_now = _frames(arena, config.ARENA_MIN_SIGHTINGS - 1, corner_px, t_now)
+check("4개가 같이 보인 프레임이 (MIN-1)개면 아직 미확정", not arena.ready(t_now))
+t_now = _frames(arena, 1, corner_px, t_now)
+poly9 = arena.world_polygon(w9, t_now)
+check("4개가 같이 보인 프레임이 MIN개 쌓이면 영역 확정", poly9 is not None and geofence.is_convex(poly9), f"{poly9}")
+check("영역 크기 = 마커 중심 간 거리(80x52cm)",
+      abs(max(p[0] for p in poly9) - min(p[0] for p in poly9) - 80) < 0.5
+      and abs(max(p[1] for p in poly9) - min(p[1] for p in poly9) - 52) < 0.5, f"{poly9}")
+
+# 모서리 하나가 가려져도(3개 보임) 영역이 유지된다
+t_now = _frames(arena, 10, {k: corner_px[k] for k in ids9[:3]}, t_now)
+check("모서리 1개 가려짐 -> 영역 유지", arena.world_polygon(w9, t_now) is not None)
+
+# 카메라가 움직이는 경우: 모든 점이 (+60,+40)px 이동하고 1.1배 확대, 모서리 2개만 보여도 가려진 모서리를 추정한다
+def _moved(pt):
+    return (pt[0] * 1.1 + 60.0, pt[1] * 1.1 + 40.0)
+
+moved = {k: _moved(v) for k, v in corner_px.items()}
+t_now = _frames(arena, 5, {ids9[0]: moved[ids9[0]], ids9[2]: moved[ids9[2]]}, t_now)     # 대각선 2개만 보임
+est_err = max(float(np.linalg.norm(arena._cur[k] - np.array(moved[k]))) for k in ids9)
+check("카메라 이동(+이동,+확대) 후 2개만 보여도 가려진 모서리를 추정(오차 < 2px)", est_err < 2.0, f"err={est_err:.2f}px")
+check("추정 중에도 영역 사용 가능", arena.world_polygon(w9, t_now) is not None)
+t_now = _frames(arena, 5, {k: moved[k] for k in ids9[:3]}, t_now)
+est_err = max(float(np.linalg.norm(arena._cur[k] - np.array(moved[k]))) for k in ids9)
+check("3개 보임(아핀) -> 추정 오차 < 1px", est_err < 1.0, f"err={est_err:.2f}px")
+
+# 회전도 따라간다 (중심 기준 20도)
+import math as _m  # noqa: E402
+ca, sa = _m.cos(_m.radians(20)), _m.sin(_m.radians(20))
+rot = {k: (600 + (v[0] - 600) * ca - (v[1] - 360) * sa, 360 + (v[0] - 600) * sa + (v[1] - 360) * ca) for k, v in corner_px.items()}
+a2 = Arena()
+tt = _frames(a2, config.ARENA_MIN_SIGHTINGS, corner_px, T0)
+tt = _frames(a2, 3, {ids9[1]: rot[ids9[1]], ids9[3]: rot[ids9[3]]}, tt)
+err = max(float(np.linalg.norm(a2._cur[k] - np.array(rot[k]))) for k in ids9)
+check("카메라 회전(20도)도 2개만 보여도 따라감 (오차 < 2px)", err < 2.0, f"err={err:.2f}px")
+
+# 모서리가 2개 미만이면 잠깐은 유지하고, STALE을 넘기면 영역을 모른다 (-> 로봇 정지)
+a3 = Arena()
+tt = _frames(a3, config.ARENA_MIN_SIGHTINGS, corner_px, T0)
+tt = _frames(a3, 4, {ids9[0]: corner_px[ids9[0]]}, tt)                         # 1개만 (0.2s)
+check("모서리 1개만 보여도 짧게는 유지(STALE 이내)", a3.ready(tt))
+later = tt + config.ARENA_STALE_S + 0.3
+a3.update(_scan9({ids9[0]: corner_px[ids9[0]]}), later)
+check("2개 미만이 STALE보다 오래 -> 영역 모름(not ready)", not a3.ready(later) and a3.world_polygon(w9, later) is None)
+a3.update(_scan9({ids9[0]: corner_px[ids9[0]], ids9[1]: corner_px[ids9[1]]}), later + 0.05)
+check("2개 이상 다시 보이면 복구", a3.ready(later + 0.05))
+
+# 말도 안 되는 변환(확대 3배)은 버린다
+a4 = Arena()
+tt = _frames(a4, config.ARENA_MIN_SIGHTINGS, corner_px, T0)
+wild = {ids9[0]: (0.0, 0.0), ids9[1]: (4000.0, 0.0)}                            # 간격이 5배로 늘어난 가짜 검출
+before = {k: v.copy() for k, v in a4._cur.items()}
+a4.update(_scan9(wild), tt + 0.05)
+check("터무니없는 확대 변환은 무시 (영역 위치 유지)", all(np.allclose(a4._cur[k], before[k]) for k in ids9))
+
+# 팔 필터: 손목이 영역 안일 때만 반응한다
+class _J9:
+    def __init__(self, x, y):
+        self.x_cm, self.y_cm = x, y
+
+
+class _H9:
+    def __init__(self, wrists, others=()):
+        self.detected = True
+        self.wrists = list(wrists)
+        self.repulsion_points = list(wrists) + list(others)
+
+
+cx9 = sum(p[0] for p in poly9) / 4
+cy9 = sum(p[1] for p in poly9) / 4
+inside_w = _J9(cx9, cy9)
+outside_w = _J9(cx9 + 200.0, cy9)            # 테이블 밖
+poly9 = arena.world_polygon(w9, t_now)
+zh = arena.filter_human(_H9([inside_w, outside_w], [_J9(cx9 + 300, cy9)]), poly9)
+check("영역 안 손목만 남김(밖의 손목/몸 제외)", zh.detected and len(zh.wrists) == 1 and len(zh.repulsion_points) == 1,
+      f"wrists={len(zh.wrists)} rep={len(zh.repulsion_points)}")
+zh = arena.filter_human(_H9([outside_w], [_J9(cx9 + 300, cy9)]), poly9)
+check("손목이 모두 영역 밖이면 사람 없음(detected=False)", (not zh.detected) and not zh.wrists)
+
+# 팔 인식 경계 여유(ARENA_HAND_MARGIN_CM): 가장자리 바로 밖의 손목은 안으로 보고, 멀리 벗어나면 제외
+_edge_x = max(p[0] for p in poly9)
+_m = config.ARENA_HAND_MARGIN_CM
+zh_near = arena.filter_human(_H9([_J9(_edge_x + _m - 2.0, cy9)]), poly9)
+zh_far = arena.filter_human(_H9([_J9(_edge_x + _m + 2.0, cy9)]), poly9)
+check("경계 바로 밖(여유 안) 손목은 영역 안으로 인정", zh_near.detected, f"margin={_m}")
+check("여유보다 더 멀리 벗어난 손목은 제외", not zh_far.detected)
+
+# 판단: 영역 밖 손은 컵에 가까워도(투영상) 위험 판정 안 함, 영역 안이면 판정
+ev9 = RiskEvaluator()
+cup9 = FakeDet(cx9, cy9)
+tt9 = 9000.0
+for _ in range(10):
+    tt9 += 0.05
+    s9 = ev9.evaluate(arena.filter_human(_H9([_J9(cx9 + 200.0, cy9)]), poly9), cup9, tt9)
+check("손목이 영역 밖 -> SAFE (로봇 반응 없음)", s9.level == "SAFE", f"got {s9.level}")
+for _ in range(10):
+    tt9 += 0.05
+    s9 = ev9.evaluate(arena.filter_human(_H9([_J9(cx9 + 5.0, cy9)]), poly9), cup9, tt9)
+check("손목이 영역 안에서 컵에 5cm -> DANGER", s9.level == "DANGER", f"got {s9.level}")
+
+# 손이 영역 밖으로 나갔다고 확실하면 DANGER 유지시간을 끊는다 (영역 밖의 팔에는 반응 안 함)
+ev_c = RiskEvaluator()
+tc = 9400.0
+for _ in range(10):
+    tc += 0.05
+    sc_ = ev_c.evaluate(arena.filter_human(_H9([_J9(cx9 + 5.0, cy9)]), poly9), cup9, tc)
+check("영역 안에서 근접 -> DANGER", sc_.level == "DANGER")
+tc += 0.05
+held = ev_c.evaluate(arena.filter_human(_H9([_J9(cx9 + 200.0, cy9)]), poly9), cup9, tc)
+check("(대조) 유지시간 안에서는 영역 밖으로 나가도 DANGER 유지", held.level == "DANGER", f"got {held.level}")
+ev_c.clear_hold()
+tc += 0.05
+cleared = ev_c.evaluate(arena.filter_human(_H9([_J9(cx9 + 200.0, cy9)]), poly9), cup9, tc)
+check("clear_hold 후 영역 밖 손 -> 바로 SAFE", cleared.level == "SAFE", f"got {cleared.level}")
+
+# 통합: 오른쪽 가장자리의 로봇에게 왼쪽에서 손이 다가와도, 로봇은 오른쪽 경계 밖으로 물러나지 않는다
+_seek9 = config.SEEK_CUP
+config.SEEK_CUP = False
+pf9 = PotentialField()
+rb9 = FakeRobot(100.0 - M, 50.0, 0.0)
+t9 = 9500.0
+blocked = None
+for _ in range(20):
+    t9 += 0.05
+    f9 = pf9.compute(rb9, FakeDet(100.0 - M, 50.0), [], FakeHuman(joints=[FakeJoint(100.0 - M - 20.0, 50.0)]), "DANGER", t9)
+raw_vx = f9.vx_world
+gvx9, gvy9, gst9 = geofence.clamp_velocity(SQ, (rb9.x_cm, rb9.y_cm), (f9.vx_world, f9.vy_world), M, INF)
+config.SEEK_CUP = _seek9
+check("회피가 경계 바깥(+x)으로 향하는데(계산된 속도 > 0)", raw_vx > 3.0, f"vx={raw_vx:.1f}")
+check("경계에서는 그 성분이 막힘 (로봇이 가장자리를 넘지 않음)", abs(gvx9) < 1e-6 and gst9 == "limited", f"vx={gvx9:.2f} state={gst9}")
+
+
+import csv  # noqa: E402
+# ============================================================
+print("\n[10] 로봇 폴트: MOTOR_STALL 자동 리셋 + 텔레메트리 기록 (가짜 로봇)")
+# ============================================================
+import json as _json  # noqa: E402
+import os as _os  # noqa: E402
+import socket as _sock  # noqa: E402
+import tempfile as _tmp  # noqa: E402
+
+from comm.udp_sender import UdpSender  # noqa: E402
+
+
+class _FakeRobot:
+    """127.0.0.1:8888에서 명령을 받고 8889로 텔레메트리를 돌려주는 가짜 ESP32."""
+
+    def __init__(self, fault):
+        self.fault = fault
+        self.got = []
+        self.rx = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        self.rx.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        self.rx.bind(("127.0.0.1", config.ESP32_PORT))
+        self.rx.settimeout(0.05)
+        self.alive = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while self.alive:
+            try:
+                d, a = self.rx.recvfrom(2048)
+            except (_sock.timeout, OSError):
+                continue
+            m = _json.loads(d)
+            self.got.append(m["type"])
+            if m["type"] == "reset_fault":
+                self.fault = "NONE"          # 리셋을 받으면 폴트가 풀린다
+            tele = {"type": "telemetry", "mode": "NETWORK", "state": "STOPPED", "fault": self.fault,
+                    "wifi_rssi": -40, "command_age_ms": 5, "cmd_vx": 0.0, "cmd_vy": 0.0, "cmd_w": 0.0,
+                    "wheel_target": [1.0, -2.0, 3.0], "wheel_speed": [0.1, 0.2, 0.3],
+                    "wheel_pwm": [40, 50, 60], "encoder_count": [10, 20, 30]}
+            self.rx.sendto(_json.dumps(tele).encode(), ("127.0.0.1", config.TELEMETRY_PORT))
+
+    def stop(self):
+        self.alive = False
+        self.rx.close()
+
+
+def _run_sender(robot, seconds):
+    s = UdpSender(ip="127.0.0.1")
+    t_end = time.time() + seconds
+    while time.time() < t_end:
+        s.send(0.0, 0.0, 0.0, "STOP")
+        time.sleep(0.03)
+    return s
+
+
+_saved = (config.ROBOT_AUTO_RESET, config.ROBOT_AUTO_RESET_WAIT_S, config.ROBOT_AUTO_RESET_MAX,
+          config.ROBOT_AUTO_RESET_WINDOW_S, config.TELEMETRY_LOG)
+_cwd = _os.getcwd()
+_td = _tmp.mkdtemp()
+_os.chdir(_td)                           # 기록 파일(logs/)이 프로젝트에 남지 않게
+try:
+    config.ROBOT_AUTO_RESET_WAIT_S = 0.2
+    config.ROBOT_AUTO_RESET_MAX = 3
+    config.ROBOT_AUTO_RESET_WINDOW_S = 30.0
+    config.TELEMETRY_LOG = True
+
+    # (1) 폴트를 받으면 WAIT 뒤 reset_fault를 보내고, 로봇이 풀리면 더 보내지 않는다
+    config.ROBOT_AUTO_RESET = True
+    fr = _FakeRobot("MOTOR_STALL")
+    s1 = _run_sender(fr, 1.5)
+    n_reset = fr.got.count("reset_fault")
+    check("MOTOR_STALL을 보면 자동으로 reset_fault 전송", n_reset >= 1, f"reset_fault x{n_reset}")
+    check("리셋으로 폴트가 풀리면 더 이상 보내지 않음", n_reset == 1 and s1.auto_reset_count == 1,
+          f"reset_fault x{n_reset} count={s1.auto_reset_count}")
+    s1.close()
+    fr.stop()
+
+    # (2) 폴트가 안 풀리는 고장(막힌 바퀴)이면 한도(3회)까지만 시도한다
+    class _Stuck(_FakeRobot):
+        def _run(self):
+            while self.alive:
+                try:
+                    d, a = self.rx.recvfrom(2048)
+                except (_sock.timeout, OSError):
+                    continue
+                m = _json.loads(d)
+                self.got.append(m["type"])
+                tele = {"type": "telemetry", "mode": "NETWORK", "state": "STOPPED", "fault": "MOTOR_STALL"}
+                self.rx.sendto(_json.dumps(tele).encode(), ("127.0.0.1", config.TELEMETRY_PORT))
+
+    fr = _Stuck("MOTOR_STALL")
+    s2 = _run_sender(fr, 2.5)
+    check("안 풀리는 폴트는 한도(3회)까지만 자동 리셋", fr.got.count("reset_fault") == 3,
+          f"reset_fault x{fr.got.count('reset_fault')}")
+    s2.reset_fault()                     # 사람이 r을 누르면 한도 초기화
+    check("수동 reset_fault 후 자동 리셋 한도 초기화", s2._reset_times == [] and not s2._auto_reset_warned)
+    s2.close()
+    fr.stop()
+
+    # (3) 자동 리셋을 끄면 보내지 않는다
+    config.ROBOT_AUTO_RESET = False
+    fr = _FakeRobot("MOTOR_STALL")
+    s3 = _run_sender(fr, 1.2)
+    check("ROBOT_AUTO_RESET=False -> reset_fault 안 보냄", fr.got.count("reset_fault") == 0)
+    s3.close()
+    fr.stop()
+
+    # (4) 자동 리셋 대상이 아닌 폴트(SPEED_LIMIT 등)는 사람이 확인해야 한다
+    config.ROBOT_AUTO_RESET = True
+    fr = _FakeRobot("SPEED_LIMIT")
+    s4 = _run_sender(fr, 1.2)
+    check("대상이 아닌 폴트(SPEED_LIMIT)는 자동 리셋 안 함", fr.got.count("reset_fault") == 0)
+    s4.close()
+    fr.stop()
+
+    # (5) 텔레메트리 CSV 기록
+    logs = [f for f in _os.listdir("logs") if f.startswith("telemetry_")] if _os.path.isdir("logs") else []
+    check("텔레메트리 기록 파일 생성", len(logs) >= 1, f"{logs}")
+    if logs:
+        with open(_os.path.join("logs", sorted(logs)[0]), encoding="utf-8") as fh:
+            rows = list(csv.reader(fh))
+        check("기록에 바퀴별 목표/속도/PWM/엔코더 포함", rows[0][8:20] == ["tgt1", "tgt2", "tgt3", "spd1", "spd2", "spd3", "pwm1", "pwm2", "pwm3", "enc1", "enc2", "enc3"]
+              and len(rows) > 3 and rows[1][8:11] == ["1.0", "-2.0", "3.0"], f"rows={len(rows)} first={rows[1] if len(rows) > 1 else None}")
+finally:
+    (config.ROBOT_AUTO_RESET, config.ROBOT_AUTO_RESET_WAIT_S, config.ROBOT_AUTO_RESET_MAX,
+     config.ROBOT_AUTO_RESET_WINDOW_S, config.TELEMETRY_LOG) = _saved
+    _os.chdir(_cwd)
+
+
+# ============================================================
 print("\n" + "=" * 50)
 print(f"결과: {passed} PASS / {failed} FAIL")
 print("=" * 50)
