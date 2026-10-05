@@ -31,3 +31,6 @@ grip_samples.csv
 
 # 로봇 텔레메트리 기록
 logs/
+
+# 펌웨어 Wi-Fi 이름/비밀번호
+secrets.h

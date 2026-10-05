@@ -44,8 +44,12 @@ comm/                     [4] 전송 계층
 ui/settings_panel.py      실시간 튜닝 패널 (슬라이더). 별도 프로세스로 실행
 tuning.json               패널에서 저장한 값. 다음 실행 때 자동 적용 (없으면 config 기본값)
 
-esp32/esp32_omni_controller/
-  esp32_omni_controller.ino [5] 제어 계층 (Arduino IDE로 업로드)
+esp32/esp32_omni_controller/ [5] 제어 계층 (Arduino IDE로 업로드, .ino와 .h/.cpp를 한 폴더에서 같이 연다)
+  esp32_omni_controller.ino   setup/loop, Serial·Wi-Fi·UDP 처리
+  robot_config.h              핀, 기하, 속도 한계, PID/FF, 정지 감지 상수
+  motor_encoder.* / kinematics_motion.* / network_protocol.* / safety_telemetry.*
+  secrets.example.h           -> secrets.h로 복사해 Wi-Fi 이름/비밀번호 입력 (secrets.h는 git에 올라가지 않는다)
+esp32/README.md               펌웨어 구조, 핀맵, Serial 명령, 안전 경계 설명
 
 tools/selftest.py            하드웨어 없이 [2][3][5] 로직 검증 (47개 테스트)
 tools/check_camera.py        카메라 + 인식 5종을 계층별로 켜고 끄며 눈으로 확인
@@ -161,18 +165,18 @@ CLASS_OBSTACLE_NAMES = ("obstacle", "box", "bottle", "chair")
 
 ### 5) ESP32
 
-`esp32/esp32_omni_controller/esp32_omni_controller.ino`를 열고 수정:
+`esp32/esp32_omni_controller/esp32_omni_controller.ino`를 Arduino IDE로 연다 (같은 폴더의 `.h`/`.cpp`가 함께 열린다).
+자세한 구조와 Serial 명령은 [esp32/README.md](esp32/README.md).
 
-| 항목 | 위치 |
-|---|---|
-| WiFi SSID / 비밀번호 | `WIFI_SSID`, `WIFI_PASS` |
-| 고정 IP (`config.ESP32_IP`와 일치) | `LOCAL_IP` |
-| 바퀴 반지름 / 로봇 반지름 | `WHEEL_RADIUS_CM`, `ROBOT_RADIUS_CM` |
-| 엔코더 CPR / 감속비 | `ENCODER_CPR`, `GEAR_RATIO` |
-| 모터·엔코더 핀 | `PIN_PWM`, `PIN_IN1/IN2`, `PIN_ENC_A/B` |
-| 바퀴 장착각 | `WHEEL_ANGLE_DEG` (기본 0/120/240°) |
+1. `secrets.example.h`를 `secrets.h`로 복사하고 로봇이 접속할 Wi-Fi 이름/비밀번호를 입력한다 (`secrets.h`는 git에서 제외된다).
+2. 보드 `esp32:esp32:esp32`, Arduino-ESP32 Core 3.3.12, 라이브러리 **ArduinoJson 7.4.3**.
+3. 올린 뒤 시리얼 모니터(115200)에서 `STATUS`를 입력하면 로봇의 IP가 나온다. 그 값을 `config.ESP32_IP`에 넣는다
+   (공유기/핫스팟이 바뀌면 IP가 달라진다).
+4. 핀, 바퀴/로봇 반지름, 엔코더 CPR, 속도 한계, PID/FF는 `robot_config.h`에서 바꾼다.
 
-라이브러리 매니저에서 **ArduinoJson v7** 설치 필요.
+PC가 보내는 명령(`cmd_vel`, `stop`, `heartbeat`, `reset_fault`, UDP 8888)과 로봇이 돌려주는 텔레메트리(UDP 8889)는
+`comm/udp_sender.py`와 `esp32/esp32_omni_controller/network_protocol.cpp`가 같은 규약이다.
+로봇의 `MOTOR_STALL` 같은 래치 폴트는 `r` 키(또는 `reset_fault`)로 풀어야 한다.
 
 ---
 
