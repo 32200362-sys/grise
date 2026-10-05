@@ -411,11 +411,11 @@ HEARTBEAT_HZ = 2             # 세션 유지 + 통신 폴트(CMD_TIMEOUT 등) �
 # 로봇이 정지 폴트(MOTOR_STALL: 바퀴가 0.5초 동안 안 돌면 래치)에 걸리면 자동으로 reset_fault를 보낸다.
 # 2026-10-05 실기: 정지 상태에서 12~15cm/s 명령으로 출발하자마자 반복해서 걸렸다 (통신은 정상).
 # 폴트는 모터 보호용이라, 막혀 있는 바퀴에 계속 전류를 흘리지 않도록 횟수를 제한한다.
-# [2026-10-05 기본 꺼짐] 텔레메트리 기록으로 M3만 간헐적으로 안 도는 것이 확인됐다 (M1/M2는 0%, M3는 구동 중 22%에서 속도 0).
-# 폴트가 진짜 고장을 잡고 있으므로, 고장난 모터를 반복해서 다시 구동하지 않도록 자동 리셋을 끈다.
-# M3를 고친 뒤 오탐이 남아 있을 때만 켤 것.
-ROBOT_AUTO_RESET = False
-ROBOT_AUTO_RESET_FAULTS = ("MOTOR_STALL",)
+# 2026-10-05 로그: M3가 구동 중 간헐적으로 안 돌거나 엔코더가 0으로 고정되고(M3 하드웨어 의심), 새 펌웨어에서는
+# 엔코더 점프(ENCODER_JUMP)도 나왔다. 자동 리셋은 증상을 가리는 용도이므로 원인(M3/엔코더 배선)을 고치기 전까지만 쓴다.
+# 한도(ROBOT_AUTO_RESET_MAX회/WINDOW초)를 넘으면 멈추고 'r'을 기다린다.
+ROBOT_AUTO_RESET = True
+ROBOT_AUTO_RESET_FAULTS = ("MOTOR_STALL", "ENCODER_JUMP")
 ROBOT_AUTO_RESET_WAIT_S = 0.6     # 폴트를 본 뒤 모터가 완전히 멈추도록 기다리는 시간
 ROBOT_AUTO_RESET_MAX = 4          # 아래 창 안에서 허용하는 자동 리셋 횟수
 ROBOT_AUTO_RESET_WINDOW_S = 20.0  # 초과하면 사람이 'r'로 리셋할 때까지 자동 리셋을 멈춘다
